@@ -50,6 +50,8 @@ export interface ElementInfo {
   inFrame?: boolean;
   inShadow?: boolean;
   flags?: ElementFlag[];
+  /** Поле формы: текст кнопки, которую нажмёт Enter в нём (для оценки риска). */
+  formSubmit?: string;
   /** Пользователь отметил это кнопкой «Далее» для сайта — модель увидит пометку. */
   next?: boolean;
   /** Внутри fixed/sticky-блока: панель интерфейса, а не содержимое страницы. */

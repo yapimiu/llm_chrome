@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { findClickPoint, NO_EFFECT_NOTE, performAndSettle, performDomAction, readFieldValue, selectFieldContent, setNativeValue, type ActContext } from '@/lib/dom/act';
+import { findClickPoint, NO_EFFECT_NOTE, performAndSettle, performDomAction, readFieldValue, selectFieldContent, setNativeValue, valueHasText, type ActContext } from '@/lib/dom/act';
 import type { Geometry } from '@/lib/dom/geometry';
 import type { RegistryEntry } from '@/lib/dom/collect';
 import { waitForStable } from '@/lib/dom/stable';
@@ -59,6 +59,20 @@ describe('performDomAction: type', () => {
     expect(input.value).toBe('новое');
     expect(reactSaw).toBe('новое');
     expect(changes).toHaveBeenCalledOnce();
+  });
+
+  it('маска поля меняет вид значения — это не ошибка ввода', () => {
+    document.body.innerHTML = '<input placeholder="Телефон">';
+    const input = document.querySelector('input')!;
+    input.addEventListener('input', () => {
+      const d = input.value.replace(/\D/g, '');
+      input.value = `+7 (${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6, 8)}-${d.slice(8, 10)}`;
+    });
+    const r = performDomAction({ action: 'type', index: 1, text: '9991234567', submit: false }, ctxFor(input));
+    expect(r.ok).toBe(true);
+    expect(input.value).toBe('+7 (999) 123-45-67');
+    expect(valueHasText('01.02.2024', '01022024')).toBe(true);
+    expect(valueHasText('abc', 'abcdef')).toBe(false);
   });
 
   it('submit: Enter и отправка формы, если сайт не перехватил', () => {

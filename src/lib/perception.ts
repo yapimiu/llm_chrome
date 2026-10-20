@@ -154,6 +154,7 @@ export async function observePage(tabId: number, url: string | undefined, opts: 
 
   const owner: Record<number, number> = {};
   const flags: Record<number, ElementFlag[]> = {};
+  const formSubmit: Record<number, string> = {};
   const elements: ElementBrief[] = snapshot.elements.map((e) => ({
     index: e.index,
     line: serializeElement(e).replace(/^\[\d+\] /, ''),
@@ -168,6 +169,7 @@ export async function observePage(tabId: number, url: string | undefined, opts: 
     for (const e of obs.elements) {
       owner[e.index] = node.frameId;
       if (e.flags?.length) flags[e.index] = e.flags;
+      if (e.formSubmit) formSubmit[e.index] = e.formSubmit;
     }
   }
 
@@ -188,7 +190,7 @@ export async function observePage(tabId: number, url: string | undefined, opts: 
       walkTruncated: snapshot.stats.walkTruncated,
       durationMs: Math.round(performance.now() - started),
     },
-    handle: { frames: parts.map((p) => ({ frameId: p.node.frameId, snapshotId: p.obs.snapshotId })), owner, nodes, flags, elements },
+    handle: { frames: parts.map((p) => ({ frameId: p.node.frameId, snapshotId: p.obs.snapshotId })), owner, nodes, flags, formSubmit, elements },
   };
 }
 

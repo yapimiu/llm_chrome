@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { CdpDriver, mousePath } from '@/lib/exec/cdp';
 
-function fakeDriver(opts: { platform?: 'mac' | 'other'; zoom?: number } = {}) {
+function fakeDriver(opts: { platform?: 'mac' | 'other' } = {}) {
   const calls: { method: string; params?: Record<string, unknown> }[] = [];
   const driver = new CdpDriver(
     async (method, params) => {
       calls.push({ method, params });
       return {};
     },
-    { sleep: async () => {}, random: () => 0.5, platform: opts.platform ?? 'other', zoom: opts.zoom ?? 1 },
+    { sleep: async () => {}, random: () => 0.5, platform: opts.platform ?? 'other' },
   );
   return { driver, calls };
 }
@@ -45,10 +45,10 @@ describe('CdpDriver', () => {
     expect(driver.position).toEqual({ x: 300, y: 200 });
   });
 
-  it('учитывает масштаб страницы', async () => {
-    const { driver, calls } = fakeDriver({ zoom: 1.25 });
-    await driver.click({ x: 100, y: 80 }, { x: 100, y: 80 });
-    expect(calls.at(-1)!.params).toMatchObject({ x: 125, y: 100 });
+  it('координаты — CSS-пиксели как есть, без умножения на масштаб страницы', async () => {
+    const { driver, calls } = fakeDriver();
+    await driver.click({ x: 100.4, y: 80.6 }, { x: 100.4, y: 80.6 });
+    expect(calls.at(-1)!.params).toMatchObject({ x: 100, y: 81 });
   });
 
   it('выделить всё: Cmd на mac, Ctrl на остальных, с командой selectAll', async () => {
@@ -94,7 +94,6 @@ describe('CdpDriver.typeChars — ввод по буквам', () => {
       sleep: async (ms) => void pauses.push(ms),
       random: () => 0.5,
       platform: 'other',
-      zoom: 1,
     });
     await driver.typeChars('x\n\ty', 25);
     expect(calls.some((c) => c.params?.key === 'Enter')).toBe(true);

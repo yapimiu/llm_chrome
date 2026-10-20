@@ -417,6 +417,7 @@ export class AgentRunner {
         action: ex.action,
         target: ex.target,
         flags: 'index' in ex.action ? (flags[ex.action.index] ?? []) : [],
+        formSubmit: 'index' in ex.action ? seen.handle.formSubmit?.[ex.action.index] : undefined,
         url: seen.url,
         modelFlag: outcome.step.risky === true,
         rules: this.cfg.riskRules,

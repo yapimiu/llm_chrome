@@ -109,6 +109,8 @@ export interface RiskInput {
   /** Строка элемента из наблюдения без номера: `button "Оплатить"`. */
   target?: string;
   flags: readonly ElementFlag[];
+  /** Для поля формы: текст кнопки, которую нажмёт Enter в нём. */
+  formSubmit?: string;
   url: string;
   /** Модель сама пометила шаг как рискованный. */
   modelFlag: boolean;
@@ -128,6 +130,10 @@ export function assessAction(input: RiskInput): RiskReason[] {
   const name = elementName(input.target);
   const lowerName = name.toLowerCase();
   const isSafe = !!lowerName && policy.safe.some((s) => lowerName.includes(s));
+  // Enter в поле формы — то же, что клик по её кнопке отправки: «Отправить», «Оплатить»…
+  const enterSubmits = action.action === 'type' && action.submit && !!input.formSubmit;
+  const submitName = enterSubmits ? input.formSubmit! : '';
+  const submitSafe = enterSubmits && policy.safe.some((s) => submitName.toLowerCase().includes(s));
   const has = (f: ElementFlag) => flags.includes(f);
 
   if (ELEMENT_ACTIONS.has(action.action)) {
@@ -144,7 +150,13 @@ export function assessAction(input: RiskInput): RiskReason[] {
           if (w) reasons.push({ kind, why: `«${name.slice(0, 60)}» (слово «${w}»)` });
         }
       }
-      if (action.action === 'type' && action.submit && has('message') && !has('search')) {
+      if (enterSubmits && !submitSafe && !has('search')) {
+        for (const kind of ['payment', 'delete', 'send'] as const) {
+          const w = matchWord(submitName, wordList(rules[kind]));
+          if (w) reasons.push({ kind, why: `Enter отправит форму кнопкой «${submitName.slice(0, 60)}» (слово «${w}»)` });
+        }
+      }
+      if (action.action === 'type' && action.submit && has('message') && !has('search') && !reasons.some((r) => r.kind === 'send')) {
         reasons.push({ kind: 'send', why: 'Enter в поле сообщения отправит его' });
       }
       const pay = matchUrl(input.url, wordList(rules.paymentUrls));

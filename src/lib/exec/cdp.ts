@@ -12,8 +12,6 @@ export interface CdpDriverOptions {
   random: () => number;
   /** На mac «выделить всё» — Cmd+A, иначе Ctrl+A. */
   platform: 'mac' | 'other';
-  /** Масштаб страницы (chrome.tabs.getZoom): CDP ждёт координаты окна, а не CSS-пиксели. */
-  zoom: number;
 }
 
 /** Описание клавиши для символа: латиница и цифры — с кодом клавиши, остальное (кириллица, знаки) — только key. */
@@ -61,7 +59,8 @@ export function mousePath(from: Point, to: Point, random: () => number): Point[]
 
 /**
  * Настоящие (isTrusted) события мыши и клавиатуры через CDP Input.*.
- * Координаты принимает в CSS-пикселях вьюпорта верхней страницы.
+ * Координаты принимает в CSS-пикселях вьюпорта верхней страницы — в них же их ждёт
+ * Input.dispatchMouseEvent при любом масштабе страницы (умножать на zoom нельзя: клик уедет).
  */
 export class CdpDriver {
   private pos: Point | null = null;
@@ -76,12 +75,8 @@ export class CdpDriver {
     return this.pos;
   }
 
-  private scaled(p: Point): Point {
-    return { x: Math.round(p.x * this.opts.zoom), y: Math.round(p.y * this.opts.zoom) };
-  }
-
   private mouse(type: string, p: Point, extra: Record<string, unknown> = {}): Promise<unknown> {
-    return this.send('Input.dispatchMouseEvent', { type, ...this.scaled(p), ...extra });
+    return this.send('Input.dispatchMouseEvent', { type, x: Math.round(p.x), y: Math.round(p.y), ...extra });
   }
 
   /** Плавно ведёт мышь к точке (события mouseMoved) — срабатывают hover-меню и подсказки. */

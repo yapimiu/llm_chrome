@@ -84,6 +84,16 @@ describe('assessAction', () => {
     expect(assess({ action: 'type', index: 2, text: 'me@x.ru', submit: false }, 'input[type=email]', ['form-secret'])).toEqual([]);
   });
 
+  it('Enter в поле формы — как клик по её кнопке отправки', () => {
+    const enter: AgentAction = { action: 'type', index: 2, text: 'hello', submit: true };
+    const field = 'input[type=text] placeholder="Your message" value=""';
+    expect(kinds(assess(enter, field, [], { formSubmit: 'Отправить' }))).toEqual(['send']);
+    expect(kinds(assess(enter, field, [], { formSubmit: 'Оплатить заказ' }))).toEqual(['payment']);
+    expect(assess(enter, field, [], { formSubmit: 'Найти' })).toEqual([]);
+    expect(assess({ ...enter, submit: false }, field, [], { formSubmit: 'Отправить' })).toEqual([]);
+    expect(assess(enter, field, [], { formSubmit: 'Отправить ответ', policy: { mode: 'ask', safe: ['отправить ответ'] } })).toEqual([]);
+  });
+
   it('Enter в поле сообщения — отправка, в поиске — нет', () => {
     const send: AgentAction = { action: 'type', index: 4, text: 'Привет!', submit: true };
     expect(kinds(assess(send, 'textarea placeholder="Сообщение"', ['message']))).toEqual(['send']);

@@ -42,15 +42,11 @@ export class DebuggerSessions {
         return null;
       }
     }
-    const [zoom, platform] = await Promise.all([
-      browser.tabs.getZoom(tabId).catch(() => 1),
-      browser.runtime.getPlatformInfo().then((p): 'mac' | 'other' => (p.os === 'mac' ? 'mac' : 'other')),
-    ]);
+    const platform = await browser.runtime.getPlatformInfo().then((p): 'mac' | 'other' => (p.os === 'mac' ? 'mac' : 'other'));
     const driver = new CdpDriver((method, params) => browser.debugger.sendCommand({ tabId }, method, params), {
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
       random: Math.random,
       platform,
-      zoom,
     });
     this.drivers.set(tabId, driver);
     return driver;

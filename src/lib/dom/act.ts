@@ -23,6 +23,15 @@ export interface ActContext {
 
 const TEXT_INPUT_TYPES = new Set(['', 'text', 'email', 'search', 'tel', 'url', 'password', 'number', 'date', 'datetime-local', 'month', 'time', 'week']);
 
+/**
+ * Попал ли текст в поле. Сравниваются только буквы и цифры: маски телефона и даты, пробелы
+ * в номере карты, переносы и отступы редактора кода меняют всё остальное. По началу — для длинного кода.
+ */
+export function valueHasText(value: string, text: string): boolean {
+  const essence = (s: string) => s.replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+  return essence(value).includes(essence(text).slice(0, 40));
+}
+
 const fail = (message: string): ActionResult => ({ ok: false, message });
 const ok = (message = 'ok'): ActionResult => ({ ok: true, message });
 
@@ -113,7 +122,7 @@ function typeInto(el: Element, text: string, submit: boolean): ActionResult {
     setNativeValue(input, text);
     fire(input, 'input', text);
     fire(input, 'change');
-    if (input.value !== text && input.type !== 'number') return fail(`the page rejected the value (field now contains "${input.value.slice(0, 40)}")`);
+    if (!valueHasText(input.value, text) && input.type !== 'number') return fail(`the page rejected the value (field now contains "${input.value.slice(0, 40)}")`);
   } else if (el.getAttribute('contenteditable') !== null && el.getAttribute('contenteditable') !== 'false') {
     (el as HTMLElement).focus({ preventScroll: true });
     const doc = el.ownerDocument;

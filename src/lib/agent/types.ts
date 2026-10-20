@@ -30,6 +30,8 @@ export interface ObservationHandle {
   nodes: FrameNode[];
   /** Признаки элементов для оценки риска (номер → флаги). */
   flags?: Record<number, ElementFlag[]>;
+  /** Поле формы → текст кнопки, которую нажмёт Enter в нём. */
+  formSubmit?: Record<number, string>;
   /** Сводка элементов для режима пролистывания: где на странице, можно ли нажать. */
   elements?: ElementBrief[];
 }

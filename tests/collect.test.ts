@@ -781,3 +781,17 @@ describe('collectSnapshot: «@иконки»', () => {
     expect(snapshot.elements.map((e) => e.name)).toEqual(['Проверить']);
   });
 });
+
+describe('кнопка отправки формы для поля', () => {
+  it('поле запоминает текст кнопки, которую нажмёт Enter', () => {
+    const { snapshot } = collect(`
+      <form data-rect="0 0 500 100">
+        <input placeholder="Сообщение" data-rect="0 0 200 20"><button type="button" data-rect="0 30 100 20">Смайлик</button><button data-rect="0 60 100 20">Отправить</button>
+      </form>
+      <input placeholder="Вне формы" data-rect="0 200 200 20">`);
+    const field = (p: string) => snapshot.elements.find((e) => e.tag === 'input' && (e.name === p || e.attrs.some(([k, v]) => k === 'placeholder' && v === p)));
+    expect(field('Сообщение')?.formSubmit).toBe('Отправить');
+    expect(field('Вне формы')?.formSubmit).toBeUndefined();
+    expect(snapshot.elements.find((e) => e.name === 'Отправить')?.formSubmit).toBeUndefined();
+  });
+});

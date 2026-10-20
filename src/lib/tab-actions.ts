@@ -1,7 +1,7 @@
 import { browser } from '#imports';
 import type { AgentAction } from './agent/actions';
 import type { ActionResult, ObservationHandle } from './agent/types';
-import { isDomAction, NO_EFFECT_NOTE } from './dom/act';
+import { isDomAction, NO_EFFECT_NOTE, valueHasText } from './dom/act';
 import type { CdpDriver, Point } from './exec/cdp';
 import { ensureContentScript, frameOffset, isRestrictedUrl, sendToContent } from './perception';
 
@@ -227,8 +227,6 @@ async function cdpClick(index: number, where: Located, handle: ObservationHandle
   return { ok: true, message: mutations === 0 ? `clicked, ${NO_EFFECT_NOTE}` : 'clicked' };
 }
 
-const squash = (s: string) => s.replace(/\s+/g, '');
-
 async function cdpType(
   action: Extract<AgentAction, { action: 'type' }>,
   where: Located,
@@ -254,8 +252,7 @@ async function cdpType(
   const value = await sendToContent(ctx.tab.tabId, { type: 'content:read-value', snapshotId: where.snapshotId, index: action.index }, where.frameId).catch(
     () => null,
   );
-  // Редакторы кода переносят строки и расставляют отступы — сравниваем без пробелов и по началу.
-  if (value !== null && action.text && !squash(value).includes(squash(action.text).slice(0, 40))) {
+  if (value !== null && action.text && !valueHasText(value, action.text)) {
     return { ok: false, message: `the text did not appear in the field (it now contains "${value.slice(0, 40)}")` };
   }
   return { ok: true, message: 'typed' };

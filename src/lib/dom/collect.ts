@@ -439,7 +439,20 @@ function describe(el: Element, geom: Geometry): Omit<ElementInfo, 'index' | 'zon
   else if (expanded === 'false') info.states.push('collapsed');
   const flags = riskFlags(el);
   if (flags.length) info.flags = flags;
+  const submitName = formSubmitName(el, geom);
+  if (submitName) info.formSubmit = submitName;
   return info;
+}
+
+/** Текст кнопки, которой Enter в этом поле отправит форму: так форму можно отправить и без клика по кнопке. */
+function formSubmitName(el: Element, geom: Geometry): string {
+  if (el.localName !== 'input' || NO_VALUE_INPUTS.has((el as HTMLInputElement).type)) return '';
+  const form = (el as HTMLInputElement).form;
+  if (!form) return '';
+  const button = Array.from(form.elements).find(
+    (e) => (e.localName === 'button' && (e as HTMLButtonElement).type === 'submit') || (e.localName === 'input' && ['submit', 'image'].includes((e as HTMLInputElement).type)),
+  );
+  return button ? collapseWhitespace(accessibleName(button, geom)) : '';
 }
 
 function describeEditor(el: Element): Omit<ElementInfo, 'index' | 'zone' | 'distance' | 'rect'> {
