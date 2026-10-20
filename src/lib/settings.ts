@@ -2,6 +2,7 @@ import { storage } from '#imports';
 import { DEFAULT_RISK_RULES, type RiskRules, type SiteRiskMode } from './agent/risk';
 import type { SiteNote } from './agent/site-notes';
 import { PROVIDERS, type ProviderId } from './llm/providers';
+import type { ScreenshotMode } from './agent/runner';
 
 export type ProfileId = 'fast' | 'slow' | 'cloud';
 
@@ -35,6 +36,8 @@ export interface LlmProfile {
   thinking: boolean;
   /** JSON-объект, вмешиваемый в тело запроса (top_k, min_p, свои флаги сервера…). */
   extraBody: string;
+  /** Модель понимает картинки (Gemini, Qwen-VL, Gemma 3, llava): ей можно слать скриншоты. */
+  vision: boolean;
 }
 
 export interface AgentSettings {
@@ -63,6 +66,8 @@ export interface AgentSettings {
   skipWithAgent: boolean;
   /** Сколько шагов даётся нейросети на одну заминку при пролистывании. */
   skipAgentSteps: number;
+  /** Скриншот с номерами элементов модели со зрением: никогда / когда застрял / каждый шаг. */
+  screenshots: ScreenshotMode;
 }
 
 export interface SafetySettings {
@@ -72,6 +77,17 @@ export interface SafetySettings {
   sound: boolean;
   /** Автономный режим: сколько ждать подтверждения, прежде чем отложить действие в очередь (0 — сразу). */
   approvalWindowSec: number;
+}
+
+/** Уведомления в Telegram: запросы подтверждения с кнопками, вопросы агента, итог задачи. */
+export interface NotifySettings {
+  telegram: boolean;
+  /** Токен бота от @BotFather. */
+  botToken: string;
+  /** Чат, куда писать и откуда принимать ответы (остальные игнорируются). */
+  chatId: string;
+  /** Сообщать, чем кончилась задача. */
+  onFinish: boolean;
 }
 
 export interface LoggingSettings {
@@ -85,6 +101,7 @@ export interface Settings {
   agent: AgentSettings;
   safety: SafetySettings;
   logging: LoggingSettings;
+  notify: NotifySettings;
   /** Подсказки для конкретных сайтов («Узнать ответ» = проверить и т.п.). */
   siteNotes: SiteNote[];
 }
@@ -105,6 +122,7 @@ export const DEFAULT_SETTINGS: Settings = {
       structuredOutput: 'auto',
       thinking: false,
       extraBody: '',
+      vision: false,
     },
     slow: {
       label: 'Ночной',
@@ -119,6 +137,7 @@ export const DEFAULT_SETTINGS: Settings = {
       structuredOutput: 'auto',
       thinking: true,
       extraBody: '',
+      vision: false,
     },
     cloud: {
       label: 'Облако',
@@ -133,6 +152,7 @@ export const DEFAULT_SETTINGS: Settings = {
       structuredOutput: 'auto',
       thinking: true,
       extraBody: '',
+      vision: true,
     },
   },
   agent: {
@@ -145,6 +165,7 @@ export const DEFAULT_SETTINGS: Settings = {
     typeByKeys: false,
     typeDelayMs: 30,
     skipAgentSteps: 25,
+    screenshots: 'stuck',
     approveEachStep: false,
     maxObservationChars: 12000,
     autonomous: false,
@@ -161,6 +182,12 @@ export const DEFAULT_SETTINGS: Settings = {
     remoteEnabled: false,
     remoteUrl: '',
   },
+  notify: {
+    telegram: false,
+    botToken: '',
+    chatId: '',
+    onFinish: true,
+  },
   siteNotes: [],
 };
 
@@ -169,6 +196,7 @@ const MAX_NOTE_CHARS = 4000;
 const MAX_RULE_CHARS = 4000;
 const RISK_MODES: readonly SiteRiskMode[] = ['ask', 'allow', 'block'];
 
+const SCREENSHOT_MODES: readonly ScreenshotMode[] = ['off', 'stuck', 'always'];
 const STRUCTURED_MODES: readonly StructuredOutputMode[] = ['auto', 'json_schema', 'json_object', 'off'];
 const PROFILE_IDS: readonly ProfileId[] = ['fast', 'slow', 'cloud'];
 
@@ -211,6 +239,7 @@ function sanitizeProfile(raw: unknown, def: LlmProfile): LlmProfile {
       : def.structuredOutput,
     thinking: bool(r.thinking, def.thinking),
     extraBody: str(r.extraBody, def.extraBody).trim(),
+    vision: bool(r.vision, def.vision),
   };
 }
 
@@ -245,6 +274,7 @@ function sanitizeAgent(raw: unknown, def: AgentSettings): AgentSettings {
     typeByKeys: bool(r.typeByKeys, def.typeByKeys),
     typeDelayMs: num(r.typeDelayMs, def.typeDelayMs, 0, 1000, true),
     skipAgentSteps: num(r.skipAgentSteps, def.skipAgentSteps, 3, 200, true),
+    screenshots: SCREENSHOT_MODES.includes(r.screenshots as ScreenshotMode) ? (r.screenshots as ScreenshotMode) : def.screenshots,
   };
 }
 
@@ -267,6 +297,7 @@ export function sanitizeSettings(raw: unknown, defaults: Settings = DEFAULT_SETT
   const r: Unknown<Settings> = isRecord(raw) ? raw : {};
   const rawProfiles = isRecord(r.profiles) ? r.profiles : {};
   const logging: Unknown<LoggingSettings> = isRecord(r.logging) ? r.logging : {};
+  const notify: Unknown<NotifySettings> = isRecord(r.notify) ? r.notify : {};
   return {
     activeProfile: PROFILE_IDS.includes(r.activeProfile as ProfileId)
       ? (r.activeProfile as ProfileId)
@@ -281,6 +312,12 @@ export function sanitizeSettings(raw: unknown, defaults: Settings = DEFAULT_SETT
     logging: {
       remoteEnabled: bool(logging.remoteEnabled, defaults.logging.remoteEnabled),
       remoteUrl: str(logging.remoteUrl, defaults.logging.remoteUrl).trim(),
+    },
+    notify: {
+      telegram: bool(notify.telegram, defaults.notify.telegram),
+      botToken: str(notify.botToken, defaults.notify.botToken).trim(),
+      chatId: str(notify.chatId, defaults.notify.chatId).trim(),
+      onFinish: bool(notify.onFinish, defaults.notify.onFinish),
     },
     siteNotes: Array.isArray(r.siteNotes)
       ? r.siteNotes

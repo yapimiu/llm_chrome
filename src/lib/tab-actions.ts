@@ -1,7 +1,7 @@
 import { browser } from '#imports';
-import type { AgentAction } from './agent/actions';
+import { targetIndex, type AgentAction } from './agent/actions';
 import type { ActionResult, ObservationHandle } from './agent/types';
-import { isDomAction, NO_EFFECT_NOTE, valueHasText } from './dom/act';
+import { isDomAction, NO_EFFECT_NOTE, valueHasText, type DomAction } from './dom/act';
 import type { CdpDriver, Point } from './exec/cdp';
 import { ensureContentScript, frameOffset, isRestrictedUrl, sendToContent } from './perception';
 
@@ -107,20 +107,23 @@ export async function executeAction(action: AgentAction, handle: ObservationHand
   }
 }
 
-type DomAgentAction = Extract<AgentAction, { action: 'click' | 'type' | 'select' | 'scroll' }>;
+type DomAgentAction = DomAction;
 
 interface Located {
   frameId: number;
   snapshotId: number;
 }
 
-/** В каком фрейме и снимке живёт элемент; прокрутка — всегда в верхнем документе. */
-function locate(action: DomAgentAction, handle: ObservationHandle): Located | string {
-  const frameId = action.action === 'scroll' ? 0 : handle.owner[action.index];
-  if (frameId === undefined) return `element [${(action as { index: number }).index}] does not exist in the current page state`;
+/** В каком фрейме и снимке живёт элемент; действия без элемента (прокрутка страницы, клавиша) — в верхнем документе. */
+function locate(action: DomAgentAction, handle: ObservationHandle, index = targetIndex(action)): Located | string {
+  const frameId = index === undefined ? 0 : handle.owner[index];
+  if (frameId === undefined) return `element [${index}] does not exist in the current page state`;
   const snapshotId = handle.frames.find((f) => f.frameId === frameId)?.snapshotId;
   return snapshotId === undefined ? 'the page state is outdated; look at the new page state' : { frameId, snapshotId };
 }
+
+/** Действия, которым нужны настоящие события мыши и клавиатуры (CDP); select, прокрутка и ожидание — через DOM. */
+const CDP_ACTIONS: ReadonlySet<AgentAction['action']> = new Set(['click', 'type', 'hover', 'drag', 'press_key']);
 
 async function executeDom(action: DomAgentAction, handle: ObservationHandle, ctx: ExecContext): Promise<ActionResult> {
   const { tab } = ctx;
@@ -129,9 +132,9 @@ async function executeDom(action: DomAgentAction, handle: ObservationHandle, ctx
   const where = locate(action, handle);
   if (typeof where === 'string') return { ok: false, message: where };
 
-  // CDP — для кликов и ввода; select (нативный список) и прокрутка надёжнее через DOM.
-  const driver = (action.action === 'click' || action.action === 'type') && ctx.cdp ? await ctx.cdp(tab.tabId) : null;
-  const fallbackNote = (action.action === 'click' || action.action === 'type') && ctx.cdp && !driver ? ctx.cdpUnavailable?.() : '';
+  const wantsCdp = CDP_ACTIONS.has(action.action);
+  const driver = wantsCdp && ctx.cdp ? await ctx.cdp(tab.tabId) : null;
+  const fallbackNote = wantsCdp && ctx.cdp && !driver ? ctx.cdpUnavailable?.() : '';
 
   // Ссылка с target=_blank откроет вкладку — ловим её и переключаемся.
   let opened: number | null = null;
@@ -145,7 +148,12 @@ async function executeDom(action: DomAgentAction, handle: ObservationHandle, ctx
     await ensureContentScript(tab.tabId, before.url);
     if (driver && action.action === 'click') result = await cdpClick(action.index, where, handle, ctx, driver);
     else if (driver && action.action === 'type') result = await cdpType(action, where, handle, ctx, driver);
-    else {
+    else if (driver && action.action === 'hover') result = await cdpHover(action.index, where, handle, ctx, driver);
+    else if (driver && action.action === 'drag') result = await cdpDrag(action, where, handle, ctx, driver);
+    else if (driver && action.action === 'press_key') {
+      await driver.pressKey(action.key);
+      result = { ok: true, message: `pressed ${action.key}` };
+    } else {
       if (ctx.showCursor && action.action === 'click') await showCursorAt(action.index, where, handle, ctx);
       result = await sendToContent(tab.tabId, { type: 'content:act', action, snapshotId: where.snapshotId }, where.frameId);
     }
@@ -183,8 +191,8 @@ async function executeDom(action: DomAgentAction, handle: ObservationHandle, ctx
 export const SAME_PAGE_NOTE = 'still on the same page (URL unchanged)';
 
 /** Точка клика в координатах верхней страницы (с учётом iframe). */
-async function topPoint(index: number, where: Located, handle: ObservationHandle, ctx: ExecContext): Promise<Point | string> {
-  const local = await sendToContent(ctx.tab.tabId, { type: 'content:target-point', snapshotId: where.snapshotId, index }, where.frameId);
+async function topPoint(index: number, where: Located, handle: ObservationHandle, ctx: ExecContext, noScroll = false): Promise<Point | string> {
+  const local = await sendToContent(ctx.tab.tabId, { type: 'content:target-point', snapshotId: where.snapshotId, index, noScroll }, where.frameId);
   if (!local.ok) return local.message;
   const off = await frameOffset(ctx.tab.tabId, handle.nodes, where.frameId);
   return { x: local.x + off.x, y: local.y + off.y };
@@ -225,6 +233,35 @@ async function cdpClick(index: number, where: Located, handle: ObservationHandle
   await Promise.all([animateCursor(ctx, p), driver.click(p)]);
   const mutations = await settled();
   return { ok: true, message: mutations === 0 ? `clicked, ${NO_EFFECT_NOTE}` : 'clicked' };
+}
+
+async function cdpHover(index: number, where: Located, handle: ObservationHandle, ctx: ExecContext, driver: CdpDriver): Promise<ActionResult> {
+  const p = await topPoint(index, where, handle, ctx);
+  if (typeof p === 'string') return { ok: false, message: p };
+  const settled = await watchFrames(ctx, where.frameId);
+  await driver.moveTo(p);
+  const mutations = await settled();
+  return { ok: true, message: mutations === 0 ? `hovered, ${NO_EFFECT_NOTE}` : 'hovered' };
+}
+
+async function cdpDrag(
+  action: Extract<AgentAction, { action: 'drag' }>,
+  where: Located,
+  handle: ObservationHandle,
+  ctx: ExecContext,
+  driver: CdpDriver,
+): Promise<ActionResult> {
+  const from = await topPoint(action.index, where, handle, ctx);
+  if (typeof from === 'string') return { ok: false, message: from };
+  const target = locate(action, handle, action.to_index);
+  if (typeof target === 'string') return { ok: false, message: target };
+  // Цель не прокручиваем: источник уже в центре экрана и уехал бы из-под мыши.
+  const to = await topPoint(action.to_index, target, handle, ctx, true);
+  if (typeof to === 'string') return { ok: false, message: `drop target: ${to} — both elements must be visible at once (scroll first)` };
+  const settled = await watchFrames(ctx, where.frameId);
+  await driver.drag(from, to);
+  const mutations = await settled();
+  return { ok: true, message: mutations === 0 ? `dragged, ${NO_EFFECT_NOTE}` : 'dragged' };
 }
 
 async function cdpType(

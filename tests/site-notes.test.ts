@@ -1,3 +1,4 @@
+import { messageText, type ChatMessage } from '@/lib/llm/client';
 import { describe, expect, it } from 'vitest';
 import { buildStepMessages } from '@/lib/agent/prompt';
 import { hiddenNamesFor, noteMatches, siteNotesFor } from '@/lib/agent/site-notes';
@@ -40,7 +41,7 @@ describe('siteNotesFor', () => {
 
 describe('заметки в промпте и настройках', () => {
   it('идут в конце, после страницы, вне её блока', () => {
-    const c = buildStepMessages({
+    const c = (buildStepMessages({
       systemTemplate: 'S',
       task: 'Пройди модуль',
       observation: 'obs',
@@ -48,7 +49,7 @@ describe('заметки в промпте и настройках', () => {
       boundary: 'b',
       maxActions: 3,
       siteNotes: '«Узнать ответ» = проверить',
-    })[1]!.content;
+    })[1]! as ChatMessage).content as string;
     expect(c).toContain('SITE NOTES (from the user, about this website — they override your own guesses):\n«Узнать ответ» = проверить');
     // В самом конце, после страницы и перед просьбой ответить.
     expect(c.indexOf('SITE NOTES')).toBeGreaterThan(c.indexOf('END PAGE'));
@@ -56,7 +57,7 @@ describe('заметки в промпте и настройках', () => {
   });
 
   it('без заметок блока нет', () => {
-    const c = buildStepMessages({ systemTemplate: 'S', task: 't', observation: 'o', tabs: [], boundary: 'b', maxActions: 3, siteNotes: '  ' })[1]!.content;
+    const c = (buildStepMessages({ systemTemplate: 'S', task: 't', observation: 'o', tabs: [], boundary: 'b', maxActions: 3, siteNotes: '  ' })[1]! as ChatMessage).content as string;
     expect(c).not.toContain('SITE NOTES');
   });
 

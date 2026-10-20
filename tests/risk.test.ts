@@ -84,6 +84,12 @@ describe('assessAction', () => {
     expect(assess({ action: 'type', index: 2, text: 'me@x.ru', submit: false }, 'input[type=email]', ['form-secret'])).toEqual([]);
   });
 
+  it('перетаскивание в «Удалить» — удаление', () => {
+    const drag: AgentAction = { action: 'drag', index: 1, to_index: 2 };
+    expect(kinds(assess(drag, 'div "Отчёт.pdf"', [], { toTarget: 'div "Удалить"' }))).toEqual(['delete']);
+    expect(assess(drag, 'div "Задача 1"', [], { toTarget: 'div "Готово"' })).toEqual([]);
+  });
+
   it('Enter в поле формы — как клик по её кнопке отправки', () => {
     const enter: AgentAction = { action: 'type', index: 2, text: 'hello', submit: true };
     const field = 'input[type=text] placeholder="Your message" value=""';

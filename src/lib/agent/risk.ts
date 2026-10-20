@@ -108,6 +108,8 @@ export interface RiskInput {
   action: AgentAction;
   /** Строка элемента из наблюдения без номера: `button "Оплатить"`. */
   target?: string;
+  /** drag: строка элемента, на который перетаскиваем. */
+  toTarget?: string;
   flags: readonly ElementFlag[];
   /** Для поля формы: текст кнопки, которую нажмёт Enter в нём. */
   formSubmit?: string;
@@ -118,9 +120,9 @@ export interface RiskInput {
   policy: SitePolicy;
 }
 
-const ELEMENT_ACTIONS: ReadonlySet<AgentAction['action']> = new Set(['click', 'type', 'select']);
+const ELEMENT_ACTIONS: ReadonlySet<AgentAction['action']> = new Set(['click', 'type', 'select', 'drag']);
 /** Для флага модели — всё, что что-то меняет в браузере. */
-const EFFECT_ACTIONS: ReadonlySet<AgentAction['action']> = new Set(['click', 'type', 'select', 'navigate', 'new_tab', 'go_back']);
+const EFFECT_ACTIONS: ReadonlySet<AgentAction['action']> = new Set(['click', 'type', 'select', 'drag', 'press_key', 'navigate', 'new_tab', 'go_back']);
 
 /** Почему действие рискованное; пустой массив — безопасно. Политику block применяет цикл агента. */
 export function assessAction(input: RiskInput): RiskReason[] {
@@ -148,6 +150,15 @@ export function assessAction(input: RiskInput): RiskReason[] {
         for (const kind of ['payment', 'delete', 'send'] as const) {
           const w = matchWord(name, wordList(rules[kind]));
           if (w) reasons.push({ kind, why: `«${name.slice(0, 60)}» (слово «${w}»)` });
+        }
+      }
+      // Перетаскивание в «Удалить» / на «Оплатить» — то же, что клик по ним.
+      if (action.action === 'drag') {
+        for (const n of [name, elementName(input.toTarget)].filter(Boolean)) {
+          for (const kind of ['payment', 'delete', 'send'] as const) {
+            const w = matchWord(n, wordList(rules[kind]));
+            if (w && !reasons.some((r) => r.kind === kind)) reasons.push({ kind, why: `перетаскивание «${n.slice(0, 60)}» (слово «${w}»)` });
+          }
         }
       }
       if (enterSubmits && !submitSafe && !has('search')) {

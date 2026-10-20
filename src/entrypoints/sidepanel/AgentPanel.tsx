@@ -3,6 +3,7 @@ import { browser } from '#imports';
 import { TERMINAL_STATUSES, type RunState, type RunStatus } from '@/lib/agent/types';
 import { isUiEvent, sendToBackground, type RunInfo } from '@/lib/messages';
 import { saveSettings, type Settings } from '@/lib/settings';
+import { Macros, SaveMacro } from './Macros';
 import { Queue } from './Queue';
 import { SkipPanel } from './SkipPanel';
 import { ActionLine, StepCard } from './StepCard';
@@ -209,6 +210,7 @@ export function AgentPanel({ task, settings }: { task: string; settings: Setting
         <div class="card result ok-border">
           <b>Результат</b>
           <p class="pre">{run.result || '(пусто)'}</p>
+          <SaveMacro run={run} />
         </div>
       )}
       {run?.status === 'deferred' && (
@@ -233,6 +235,8 @@ export function AgentPanel({ task, settings }: { task: string; settings: Setting
       )}
 
       <SkipPanel busy={active || interrupted} settings={settings} />
+
+      <Macros busy={active || interrupted} />
 
       <Queue busy={active || interrupted} />
 

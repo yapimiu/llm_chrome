@@ -32,6 +32,16 @@ export function Perception({ defaultHighlight, maxChars, siteNotes }: Props) {
   const [pickMode, setPickMode] = useState<'hide' | 'next'>('hide');
   const [hidePick, setHidePick] = useState<(HidePick & { pattern: string; mode: 'hide' | 'next' }) | null>(null);
   const [hideSaved, setHideSaved] = useState('');
+  const [shot, setShot] = useState<string | null>(null);
+
+  const screenshot = async () => {
+    setBusy(true);
+    setError('');
+    const res = await sendToBackground({ type: 'bg:screenshot', windowId: await currentWindowId() });
+    setBusy(false);
+    if (res.ok) setShot(res.value);
+    else setError(res.error);
+  };
 
   const observe = async (withHighlight = highlight) => {
     setBusy(true);
@@ -141,6 +151,9 @@ export function Perception({ defaultHighlight, maxChars, siteNotes }: Props) {
         >
           {hiding && pickMode === 'next' ? 'Отменить выбор' : 'Это кнопка «Далее»…'}
         </button>
+        <button onClick={() => void screenshot()} disabled={busy} title="Снимок экрана с номерами элементов — его получает модель со зрением">
+          Скриншот
+        </button>
         {result && (
           <button onClick={() => void copy()} title="Скопировать текст наблюдения">
             {copied ? 'Скопировано' : 'Копировать'}
@@ -205,6 +218,11 @@ export function Perception({ defaultHighlight, maxChars, siteNotes }: Props) {
         </div>
       )}
 
+      {shot && (
+        <a href={shot} target="_blank" rel="noreferrer" title="Открыть в полном размере">
+          <img class="screenshot" src={shot} alt="Скриншот с номерами элементов" />
+        </a>
+      )}
       {result && <pre class="output mono observation">{result.text}</pre>}
     </details>
   );

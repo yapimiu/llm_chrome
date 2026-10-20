@@ -100,4 +100,21 @@ describe('CdpDriver.typeChars — ввод по буквам', () => {
     expect(calls.find((c) => c.method === 'Input.insertText')?.params).toEqual({ text: '\t' });
     expect(pauses).toEqual([25, 25, 25, 25]);
   });
+
+  it('drag: нажать, сдвинуть с зажатой кнопкой, отпустить над целью', async () => {
+    const { driver, calls } = fakeDriver();
+    await driver.drag({ x: 10, y: 10 }, { x: 200, y: 50 });
+    const mouse = calls.filter((c) => c.method === 'Input.dispatchMouseEvent').map((c) => c.params!);
+    const pressAt = mouse.findIndex((p) => p.type === 'mousePressed');
+    expect(mouse[pressAt]).toMatchObject({ x: 10, y: 10 });
+    expect(mouse.slice(pressAt + 1, -1).every((p) => p.type === 'mouseMoved' && p.buttons === 1)).toBe(true);
+    expect(mouse.at(-1)).toMatchObject({ type: 'mouseReleased', x: 200, y: 50 });
+  });
+
+  it('pressKey: навигационные клавиши, Shift+Tab с модификатором', async () => {
+    const { driver, calls } = fakeDriver();
+    await driver.pressKey('Shift+Tab');
+    expect(calls[0]!.params).toMatchObject({ type: 'rawKeyDown', key: 'Tab', modifiers: 8 });
+    await expect(driver.pressKey('Enter')).rejects.toThrow(/not supported/);
+  });
 });

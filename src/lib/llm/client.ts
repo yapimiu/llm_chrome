@@ -5,10 +5,21 @@ import { apiUrl, normalizeBaseUrl } from './url';
 
 export type FetchFn = typeof fetch;
 
+/** Часть мультимодального сообщения (формат OpenAI): текст или картинка data:-адресом. */
+export type ChatPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } };
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  /** Строка или части с картинками — только для моделей, которые видят изображения. */
+  content: string | ChatPart[];
 }
+
+/** Текст сообщения без картинок. */
+export function messageText(m: ChatMessage): string {
+  return typeof m.content === 'string' ? m.content : m.content.map((p) => (p.type === 'text' ? p.text : '')).join('\n');
+}
+
+export const imageCount = (m: ChatMessage): number => (typeof m.content === 'string' ? 0 : m.content.filter((p) => p.type === 'image_url').length);
 
 /** Как реально был запрошен структурированный ответ. */
 export type StructuredFormat = 'json_schema' | 'json_object' | 'none';

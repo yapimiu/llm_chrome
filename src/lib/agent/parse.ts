@@ -1,10 +1,13 @@
 import {
   ACTION_NAMES,
+  DEFAULT_WAIT_FOR_MS,
+  KEY_NAMES,
   MAX_WAIT_MS,
   PAGE_CHANGING_ACTIONS,
   TERMINAL_ACTIONS,
   type ActionName,
   type AgentAction,
+  type KeyName,
   type AgentStep,
 } from './actions';
 
@@ -103,7 +106,34 @@ const ACTION_ALIASES: Record<string, ActionName> = {
   answer: 'done',
   ask: 'ask_user',
   click_element: 'click',
+  mouse_over: 'hover',
+  hover_element: 'hover',
+  key: 'press_key',
+  press: 'press_key',
+  keypress: 'press_key',
+  drag_and_drop: 'drag',
+  drag_drop: 'drag',
+  wait_for_text: 'wait_for',
 };
+
+const KEY_ALIASES: Record<string, KeyName> = {
+  esc: 'Escape',
+  down: 'ArrowDown',
+  up: 'ArrowUp',
+  left: 'ArrowLeft',
+  right: 'ArrowRight',
+  pagedown: 'PageDown',
+  pageup: 'PageUp',
+  'shift-tab': 'Shift+Tab',
+  shift_tab: 'Shift+Tab',
+};
+
+/** «escape», «Esc», «arrowdown» → имя из KEY_NAMES; null — клавиша не разрешена. */
+function keyName(raw: unknown): KeyName | null {
+  if (typeof raw !== 'string') return null;
+  const k = raw.trim().toLowerCase().replace(/\s+/g, '');
+  return KEY_NAMES.find((n) => n.toLowerCase() === k) ?? KEY_ALIASES[k] ?? null;
+}
 
 function actionName(raw: unknown): ActionName | null {
   if (typeof raw !== 'string') return null;
@@ -184,7 +214,31 @@ export function normalizeAction(raw: unknown): ActionResult {
       if (dir !== 'up' && dir !== 'down') return { ok: false, error: need('"direction" up|down', r.direction) };
       const rawAmount = Number(pick(r, 'amount', 'pages') ?? 1);
       const amount = Number.isFinite(rawAmount) && rawAmount > 0 ? Math.min(rawAmount, 10) : 1;
-      return { ok: true, action: { action: name, direction: dir, amount } };
+      const index = indexOf();
+      return { ok: true, action: index !== null && index >= 1 ? { action: name, direction: dir, amount, index } : { action: name, direction: dir, amount } };
+    }
+    case 'hover': {
+      const index = indexOf();
+      return index !== null && index >= 1 ? { ok: true, action: { action: name, index } } : { ok: false, error: need('integer "index" >= 1', r.index) };
+    }
+    case 'press_key': {
+      const key = keyName(pick(r, 'key', 'keys', 'name', 'value'));
+      if (key) return { ok: true, action: { action: name, key } };
+      return { ok: false, error: `"press_key" requires "key", one of: ${KEY_NAMES.join(', ')} (got ${JSON.stringify(r.key ?? null)}); for Enter use "type" with "submit": true, to press a button use "click"` };
+    }
+    case 'drag': {
+      const index = indexOf();
+      const to = toInt(pick(r, 'to_index', 'to', 'target', 'target_index', 'drop_index'));
+      if (index === null || index < 1) return { ok: false, error: need('integer "index" >= 1', r.index) };
+      if (to === null || to < 1) return { ok: false, error: need('integer "to_index" >= 1', r.to_index) };
+      return { ok: true, action: { action: name, index, to_index: to } };
+    }
+    case 'wait_for': {
+      const text = toText(pick(r, 'text', 'value', 'content'))?.trim();
+      if (!text) return { ok: false, error: need('string "text"', r.text) };
+      const ms = Number(pick(r, 'timeout_ms', 'timeout', 'ms') ?? DEFAULT_WAIT_FOR_MS);
+      const timeout = Number.isFinite(ms) ? Math.min(Math.max(0, Math.round(ms)), MAX_WAIT_MS) : DEFAULT_WAIT_FOR_MS;
+      return { ok: true, action: { action: name, text, timeout_ms: timeout } };
     }
     case 'navigate':
     case 'new_tab': {

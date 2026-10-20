@@ -6,9 +6,9 @@ import type { Geometry } from './geometry';
 import { DEFAULT_STABLE, waitForStable, type StableOptions } from './stable';
 
 /** Действия, которые выполняются внутри страницы (остальные — через API вкладок). */
-export type DomAction = Extract<AgentAction, { action: 'click' | 'type' | 'select' | 'scroll' }>;
+export type DomAction = Extract<AgentAction, { action: 'click' | 'type' | 'select' | 'scroll' | 'hover' | 'press_key' | 'drag' | 'wait_for' }>;
 
-export const DOM_ACTIONS: ReadonlySet<AgentAction['action']> = new Set(['click', 'type', 'select', 'scroll']);
+export const DOM_ACTIONS: ReadonlySet<AgentAction['action']> = new Set(['click', 'type', 'select', 'scroll', 'hover', 'press_key', 'drag', 'wait_for']);
 
 export function isDomAction(a: AgentAction): a is DomAction {
   return DOM_ACTIONS.has(a.action);
@@ -163,6 +163,24 @@ function selectOption(el: Element, value: string): ActionResult {
   return ok(`selected "${match.text.trim()}"`);
 }
 
+/** Ближайший предок (или сам элемент), который действительно прокручивается по вертикали. */
+export function scrollableAncestor(el: Element): Element | null {
+  const view = viewOf(el);
+  for (let n: Element | null = el; n && n !== n.ownerDocument.documentElement && n !== n.ownerDocument.body; n = n.parentElement ?? ((n.getRootNode() as ShadowRoot).host ?? null)) {
+    const oy = view.getComputedStyle(n).overflowY;
+    if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && n.scrollHeight > n.clientHeight + 1) return n;
+  }
+  return null;
+}
+
+function scrollBox(box: Element, direction: 'up' | 'down', amount: number): ActionResult {
+  const before = box.scrollTop;
+  box.scrollBy({ top: (direction === 'down' ? 1 : -1) * amount * box.clientHeight * 0.8, behavior: 'instant' });
+  const moved = Math.abs(box.scrollTop - before);
+  if (moved < 1) return ok(`this area is already at the ${direction === 'down' ? 'bottom' : 'top'} — nothing more to scroll`);
+  return ok(`scrolled the area ${direction} by ${Math.round(moved)}px`);
+}
+
 function scrollPage(direction: 'up' | 'down', amount: number, ctx: ActContext): ActionResult {
   const { win, scroller } = ctx;
   const doc = win.document;
@@ -177,8 +195,88 @@ function scrollPage(direction: 'up' | 'down', amount: number, ctx: ActContext): 
   return ok(`scrolled ${direction} by ${Math.round(Math.abs(after - before))}px`);
 }
 
-export function performDomAction(action: DomAction, ctx: ActContext): ActionResult {
-  if (action.action === 'scroll') return scrollPage(action.direction, action.amount, ctx);
+/** Наведение синтетическими событиями: открывает выпадающие меню и подсказки (фолбэк без CDP). */
+export function dispatchHover(target: Element): void {
+  target.scrollIntoView?.({ block: 'center', inline: 'center', behavior: 'instant' });
+  const r = target.getBoundingClientRect();
+  const view = viewOf(target);
+  const base = { bubbles: true, cancelable: true, composed: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+  const Pointer = view.PointerEvent ?? view.MouseEvent;
+  target.dispatchEvent(new Pointer('pointerover', { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+  target.dispatchEvent(new Pointer('pointerenter', { ...base, bubbles: false, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+  target.dispatchEvent(new view.MouseEvent('mouseover', base));
+  target.dispatchEvent(new view.MouseEvent('mouseenter', { ...base, bubbles: false }));
+  target.dispatchEvent(new view.MouseEvent('mousemove', base));
+}
+
+/** Код клавиши для KeyboardEvent и CDP. */
+export const KEY_CODES: Record<string, { key: string; code: string; keyCode: number }> = {
+  Escape: { key: 'Escape', code: 'Escape', keyCode: 27 },
+  Tab: { key: 'Tab', code: 'Tab', keyCode: 9 },
+  ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
+  ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+  ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+  ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+  PageUp: { key: 'PageUp', code: 'PageUp', keyCode: 33 },
+  PageDown: { key: 'PageDown', code: 'PageDown', keyCode: 34 },
+  Home: { key: 'Home', code: 'Home', keyCode: 36 },
+  End: { key: 'End', code: 'End', keyCode: 35 },
+};
+
+/** Клавиша синтетическими событиями в элемент с фокусом. Tab сам фокус не переносит — делаем это вручную. */
+function dispatchKey(key: string, win: Window): ActionResult {
+  const shift = key.startsWith('Shift+');
+  const def = KEY_CODES[shift ? key.slice(6) : key];
+  if (!def) return fail(`key "${key}" is not supported`);
+  const doc = win.document;
+  const target = deepActiveElement(doc) ?? doc.body;
+  const view = viewOf(target);
+  const init = { ...def, which: def.keyCode, shiftKey: shift, bubbles: true, cancelable: true, composed: true };
+  const down = new view.KeyboardEvent('keydown', init);
+  target.dispatchEvent(down);
+  target.dispatchEvent(new view.KeyboardEvent('keyup', init));
+  if (def.key === 'Tab' && !down.defaultPrevented) moveFocus(doc, target, shift ? -1 : 1);
+  return ok(`pressed ${key}`);
+}
+
+function deepActiveElement(doc: Document): Element | null {
+  let el: Element | null = doc.activeElement;
+  while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+  return el;
+}
+
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [contenteditable]:not([contenteditable=false])';
+
+function moveFocus(doc: Document, from: Element, dir: 1 | -1): void {
+  const all = Array.from(doc.querySelectorAll<HTMLElement>(FOCUSABLE));
+  if (all.length === 0) return;
+  const i = all.indexOf(from as HTMLElement);
+  const next = all[(i + dir + all.length) % all.length];
+  next?.focus();
+}
+
+/** Ждёт, пока текст появится на странице (без учёта регистра и лишних пробелов). */
+export async function waitForText(doc: Document, text: string, timeoutMs: number, pollMs = 200): Promise<ActionResult> {
+  const norm = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = norm(text);
+  const has = () => norm(doc.body?.innerText ?? doc.body?.textContent ?? '').includes(want);
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (has()) return ok(`"${text.slice(0, 60)}" is on the page`);
+    if (Date.now() >= deadline) return fail(`"${text.slice(0, 60)}" did not appear within ${Math.round(timeoutMs / 1000)}s`);
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
+export function performDomAction(action: Exclude<DomAction, { action: 'wait_for' }>, ctx: ActContext): ActionResult {
+  if (action.action === 'press_key') return dispatchKey(action.key, ctx.win);
+  if (action.action === 'scroll') {
+    if (action.index === undefined) return scrollPage(action.direction, action.amount, ctx);
+    const entry = lookup(action.index, ctx);
+    if (typeof entry === 'string') return fail(entry);
+    const box = scrollableAncestor(entry.element);
+    return box ? scrollBox(box, action.direction, action.amount) : scrollPage(action.direction, action.amount, ctx);
+  }
 
   const entry = lookup(action.index, ctx);
   if (typeof entry === 'string') return fail(entry);
@@ -192,6 +290,11 @@ export function performDomAction(action: DomAction, ctx: ActContext): ActionResu
       return typeInto(entry.element, action.text, action.submit);
     case 'select':
       return selectOption(entry.element, action.value);
+    case 'hover':
+      dispatchHover(entry.target);
+      return ok('hovered');
+    case 'drag':
+      return fail('drag needs real mouse events — enable "Клики через chrome.debugger (CDP)" in the extension settings');
   }
 }
 
@@ -203,10 +306,11 @@ export const NO_EFFECT_NOTE = 'but nothing on the page changed — the element m
  * Клик без единого изменения DOM — важный сигнал модели: повторять его бессмысленно.
  */
 export async function performAndSettle(action: DomAction, ctx: ActContext, stable: StableOptions = DEFAULT_STABLE): Promise<ActionResult> {
+  if (action.action === 'wait_for') return waitForText(ctx.win.document, action.text, action.timeout_ms);
   const settled = waitForStable(ctx.win.document, stable);
   const result = performDomAction(action, ctx);
   const { mutations } = await settled;
-  if (result.ok && action.action === 'click' && mutations === 0) {
+  if (result.ok && (action.action === 'click' || action.action === 'hover') && mutations === 0) {
     return { ...result, message: `${result.message}, ${NO_EFFECT_NOTE}` };
   }
   return result;
@@ -219,13 +323,13 @@ export type ClickPoint = { ok: true; x: number; y: number } | { ok: false; messa
  * в центр экрана и ищет внутри неё точку, где верхний элемент — она сама (центр, затем
  * четверти). Так клик не уйдёт в липкую шапку или всплывашку, частично закрывшую кнопку.
  */
-export function findClickPoint(entry: RegistryEntry, geom: Geometry): ClickPoint {
+export function findClickPoint(entry: RegistryEntry, geom: Geometry, scroll = true): ClickPoint {
   if (!entry.target.isConnected) return { ok: false, message: `element [${entry.index}] is gone — the page changed, look at the new page state` };
   if (isDisabled(entry.element)) return { ok: false, message: `element [${entry.index}] is disabled` };
-  entry.target.scrollIntoView?.({ block: 'center', inline: 'center', behavior: 'instant' });
+  if (scroll) entry.target.scrollIntoView?.({ block: 'center', inline: 'center', behavior: 'instant' });
   const vp = geom.viewport();
   const visible = intersect(geom.rect(entry.target), { x: 0, y: 0, width: vp.width, height: vp.height });
-  if (!visible) return { ok: false, message: `element [${entry.index}] is outside the visible area even after scrolling` };
+  if (!visible) return { ok: false, message: `element [${entry.index}] is outside the visible area${scroll ? ' even after scrolling' : ''}` };
   const root = entry.target.getRootNode() as Document | ShadowRoot;
   const at = (fx: number, fy: number) => ({ x: visible.x + visible.width * fx, y: visible.y + visible.height * fy });
   let blocker: Element | null = null;

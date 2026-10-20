@@ -202,3 +202,11 @@ button.link {
   cursor: pointer;
   font-weight: 600;
 }
+
+.screenshot {
+  display: block;
+  max-width: 100%;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 4px;
+  margin: 4px 0;
+}

@@ -11,7 +11,10 @@
     "compile": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "postinstall": "wxt prepare"
+    "postinstall": "wxt prepare",
+    "e2e": "wxt build && node e2e/run.mjs",
+    "mock-llm": "node e2e/server.mjs",
+    "chrome:install": "npx @puppeteer/browsers install chrome@stable --path .cache/chrome"
   },
   "dependencies": {
     "preact": "^10.24.0"
@@ -21,6 +24,7 @@
     "@types/jsdom": "^30.0.0",
     "fake-indexeddb": "^6.2.6",
     "jsdom": "^30.1.3",
+    "puppeteer-core": "^24.43.1",
     "typescript": "^5.6.0",
     "vitest": "^3.2.0",
     "wxt": "^0.20.0"

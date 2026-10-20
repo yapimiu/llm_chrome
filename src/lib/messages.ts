@@ -1,5 +1,6 @@
 import { browser } from '#imports';
 import type { CourseState } from './agent/course';
+import type { Macro, ReplayState } from './agent/macro';
 import type { StepEvent } from './agent/step';
 import type { ActionResult, DeferredItem, RunState, RunSummary, StepDetail } from './agent/types';
 import type { ClickPoint } from './dom/act';
@@ -72,7 +73,7 @@ export type ContentRequest =
   | { type: 'content:frame-tag' }
   | { type: 'content:frame-info' }
   | { type: 'content:frame-box'; token: string }
-  | { type: 'content:target-point'; snapshotId: number; index: number }
+  | { type: 'content:target-point'; snapshotId: number; index: number; noScroll?: boolean }
   | { type: 'content:focus-select'; snapshotId: number; index: number }
   | { type: 'content:read-value'; snapshotId: number; index: number }
   | { type: 'content:watch-start' }
@@ -90,6 +91,8 @@ export type ContentRequest =
 export type BackgroundRequest =
   | { type: 'bg:observe'; windowId: number; highlight: boolean }
   | { type: 'bg:highlight'; windowId: number; enabled: boolean }
+  /** Скриншот с номерами элементов — ровно то, что увидит модель со зрением. */
+  | { type: 'bg:screenshot'; windowId: number }
   | { type: 'bg:run-start'; windowId: number; task: string }
   | { type: 'bg:run-control'; command: 'pause' | 'resume' | 'stop' }
   | { type: 'bg:run-approve'; approved: boolean }
@@ -106,10 +109,23 @@ export type BackgroundRequest =
   | { type: 'bg:queue-dismiss'; id: string }
   /** Проверить звук и уведомление из настроек. */
   | { type: 'bg:alert-test' }
+  /** Тестовое сообщение в Telegram (настройки ещё могут быть не сохранены). */
+  | { type: 'bg:telegram-test'; config: { botToken: string; chatId: string } }
+  /** Найти chat id по последнему сообщению боту. */
+  | { type: 'bg:telegram-chat-id'; botToken: string }
   /** Пролистывание курса без модели (см. lib/agent/skipper.ts). */
   | { type: 'bg:skip-start'; windowId: number }
   | { type: 'bg:skip-stop' }
-  | { type: 'bg:skip-get' };
+  | { type: 'bg:skip-get' }
+  /** Сценарии: сохранить запуск, список, удалить, повторить, ответить повтору, передать нейросети. */
+  | { type: 'bg:macro-save'; runId: string; name: string }
+  | { type: 'bg:macro-list' }
+  | { type: 'bg:macro-delete'; id: string }
+  | { type: 'bg:macro-run'; id: string; windowId: number }
+  | { type: 'bg:macro-stop' }
+  | { type: 'bg:macro-get' }
+  | { type: 'bg:macro-reply'; approved?: boolean; text?: string | null }
+  | { type: 'bg:macro-handoff'; windowId: number };
 
 /** Текущий запуск для панели; interrupted — прерван перезапуском и ждёт «Продолжить». */
 export interface RunInfo {
@@ -122,7 +138,9 @@ export type UiEvent =
   | { type: 'ui:step-progress'; event: StepEvent }
   | { type: 'ui:run-state'; info: RunInfo }
   | { type: 'ui:queue-changed' }
-  | { type: 'ui:skip-state'; state: CourseState };
+  | { type: 'ui:skip-state'; state: CourseState }
+  | { type: 'ui:macro-state'; state: ReplayState }
+  | { type: 'ui:macros-changed' };
 
 export function isUiEvent(msg: unknown): msg is UiEvent {
   return hasType(msg, 'ui:');
@@ -151,6 +169,7 @@ export interface ContentResponses {
 export interface BackgroundResponses {
   'bg:observe': ObserveResult;
   'bg:highlight': null;
+  'bg:screenshot': string;
   'bg:run-start': RunState;
   'bg:run-control': null;
   'bg:run-approve': null;
@@ -164,9 +183,19 @@ export interface BackgroundResponses {
   'bg:queue-resume': RunState;
   'bg:queue-dismiss': null;
   'bg:alert-test': null;
+  'bg:telegram-test': null;
+  'bg:telegram-chat-id': string;
   'bg:skip-start': null;
   'bg:skip-stop': null;
   'bg:skip-get': CourseState | null;
+  'bg:macro-save': Macro;
+  'bg:macro-list': Macro[];
+  'bg:macro-delete': null;
+  'bg:macro-run': null;
+  'bg:macro-stop': null;
+  'bg:macro-get': ReplayState | null;
+  'bg:macro-reply': null;
+  'bg:macro-handoff': RunState;
 }
 
 function hasType(msg: unknown, prefix: string): msg is { type: string } {

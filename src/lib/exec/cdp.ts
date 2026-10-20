@@ -30,6 +30,21 @@ export function keyFor(ch: string): { key: string; code?: string; windowsVirtual
 
 const MODIFIER_CTRL = 2;
 const MODIFIER_META = 4;
+const MODIFIER_SHIFT = 8;
+
+/** Навигационные клавиши для press_key: key, code и виртуальный код. */
+const NAV_KEYS: Record<string, { key: string; code: string; vk: number }> = {
+  Escape: { key: 'Escape', code: 'Escape', vk: 27 },
+  Tab: { key: 'Tab', code: 'Tab', vk: 9 },
+  ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', vk: 38 },
+  ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', vk: 40 },
+  ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', vk: 37 },
+  ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', vk: 39 },
+  PageUp: { key: 'PageUp', code: 'PageUp', vk: 33 },
+  PageDown: { key: 'PageDown', code: 'PageDown', vk: 34 },
+  Home: { key: 'Home', code: 'Home', vk: 36 },
+  End: { key: 'End', code: 'End', vk: 35 },
+};
 
 const easeInOut = (t: number) => (t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2);
 
@@ -80,10 +95,10 @@ export class CdpDriver {
   }
 
   /** Плавно ведёт мышь к точке (события mouseMoved) — срабатывают hover-меню и подсказки. */
-  async moveTo(to: Point, from?: Point): Promise<void> {
+  async moveTo(to: Point, from?: Point, pressed = false): Promise<void> {
     const start = from ?? this.pos ?? to;
     for (const p of mousePath(start, to, this.opts.random)) {
-      await this.mouse('mouseMoved', p);
+      await this.mouse('mouseMoved', p, pressed ? { button: 'left', buttons: 1 } : {});
       await this.opts.sleep(8 + Math.round(this.opts.random() * 8));
     }
     this.pos = { ...to };
@@ -94,6 +109,32 @@ export class CdpDriver {
     await this.mouse('mousePressed', at, { button: 'left', buttons: 1, clickCount: 1 });
     await this.opts.sleep(40 + Math.round(this.opts.random() * 70));
     await this.mouse('mouseReleased', at, { button: 'left', buttons: 0, clickCount: 1 });
+  }
+
+  /**
+   * Перетаскивание мышью: нажать, сдвинуть на несколько пикселей (иначе библиотеки не начнут drag),
+   * довести до цели с зажатой кнопкой, отпустить. Работает для drag-n-drop на pointer/mouse-событиях.
+   */
+  async drag(from: Point, to: Point): Promise<void> {
+    await this.moveTo(from);
+    await this.mouse('mousePressed', from, { button: 'left', buttons: 1, clickCount: 1 });
+    await this.opts.sleep(120);
+    const nudge = { x: from.x + 6, y: from.y + 6 };
+    await this.mouse('mouseMoved', nudge, { button: 'left', buttons: 1 });
+    await this.moveTo(to, nudge, true);
+    await this.opts.sleep(120);
+    await this.mouse('mouseMoved', to, { button: 'left', buttons: 1 });
+    await this.mouse('mouseReleased', to, { button: 'left', buttons: 0, clickCount: 1 });
+  }
+
+  /** Навигационная клавиша (Escape, Tab, Shift+Tab, стрелки…) в элемент с фокусом. */
+  async pressKey(name: string): Promise<void> {
+    const shift = name.startsWith('Shift+');
+    const def = NAV_KEYS[shift ? name.slice(6) : name];
+    if (!def) throw new Error(`key "${name}" is not supported`);
+    const key = { key: def.key, code: def.code, windowsVirtualKeyCode: def.vk, nativeVirtualKeyCode: def.vk, modifiers: shift ? MODIFIER_SHIFT : 0 };
+    await this.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...key });
+    await this.send('Input.dispatchKeyEvent', { type: 'keyUp', ...key });
   }
 
   /** Вставка текста в сфокусированное поле — как ввод с клавиатуры (beforeinput/input). */

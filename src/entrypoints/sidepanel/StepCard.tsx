@@ -90,6 +90,14 @@ export function StepCard({ step, runId }: { step: StepRecord; runId: string }) {
                 <pre class="output mono">{detail.history}</pre>
               </>
             )}
+            {detail.screenshot && (
+              <>
+                <div class="muted">Скриншот:</div>
+                <a href={detail.screenshot} target="_blank" rel="noreferrer">
+                  <img class="screenshot" src={detail.screenshot} alt="Скриншот, который видела модель" />
+                </a>
+              </>
+            )}
             <div class="muted">Страница:</div>
             <pre class="output mono">{detail.observation}</pre>
             {detail.responses.map((r, i) => (

@@ -111,7 +111,27 @@ describe('parseAgentStep: ошибки, понятные модели', () => {
     expect(fail('<think>думаю долго')).toMatch(/empty reply/);
   });
   it('неизвестное действие перечисляет допустимые', () => {
-    expect(fail('{"actions":[{"action":"hover","index":1}]}')).toMatch(/unknown action "hover"; valid: click, type/);
+    expect(fail('{"actions":[{"action":"teleport","index":1}]}')).toMatch(/unknown action "teleport"; valid: click, type/);
+  });
+  it('новые действия: hover, press_key, drag, wait_for, прокрутка области', () => {
+    const one = (json: string) => {
+      const r = parseAgentStep(`{"actions":[${json}]}`, 4);
+      if (!r.ok) throw new Error(r.error);
+      return r.step.actions[0];
+    };
+    expect(one('{"action":"mouse_over","element":"[5]"}')).toEqual({ action: 'hover', index: 5 });
+    expect(one('{"action":"press_key","key":"esc"}')).toEqual({ action: 'press_key', key: 'Escape' });
+    expect(one('{"action":"key","key":"shift+tab"}')).toEqual({ action: 'press_key', key: 'Shift+Tab' });
+    expect(one('{"action":"drag_and_drop","index":2,"to":7}')).toEqual({ action: 'drag', index: 2, to_index: 7 });
+    expect(one('{"action":"wait_for","text":"Готово"}')).toEqual({ action: 'wait_for', text: 'Готово', timeout_ms: 10000 });
+    expect(one('{"action":"wait_for","text":"x","timeout_ms":999999}')).toMatchObject({ timeout_ms: 30000 });
+    expect(one('{"action":"scroll","direction":"down","index":4}')).toEqual({ action: 'scroll', direction: 'down', amount: 1, index: 4 });
+    expect(one('{"action":"scroll","direction":"down"}')).toEqual({ action: 'scroll', direction: 'down', amount: 1 });
+  });
+  it('press_key не нажимает Enter и пробел — это клик или отправка', () => {
+    expect(fail('{"actions":[{"action":"press_key","key":"Enter"}]}')).toMatch(/for Enter use "type"/);
+    expect(fail('{"actions":[{"action":"press_key","key":" "}]}')).toMatch(/press_key/);
+    expect(fail('{"actions":[{"action":"drag","index":1}]}')).toMatch(/to_index/);
   });
   it('нет обязательного поля', () => {
     expect(fail('{"actions":[{"action":"click"}]}')).toMatch(/actions\[0\]: "click" requires integer "index"/);

@@ -231,7 +231,7 @@ export default defineContentScript({
           highlight(msg.enabled);
           return { ok: true, value: null };
         case 'content:target-point':
-          return { ok: true, value: findClickPoint(entryOf(msg.snapshotId, msg.index), geom) };
+          return { ok: true, value: findClickPoint(entryOf(msg.snapshotId, msg.index), geom, !msg.noScroll) };
         case 'content:focus-select':
           selectFieldContent(entryOf(msg.snapshotId, msg.index).element);
           return { ok: true, value: null };

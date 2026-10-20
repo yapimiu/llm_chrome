@@ -4,7 +4,7 @@ import { parseAgentStep } from './parse';
 import { buildStepMessages, correctionMessage, estimateTokens, type TabInfo } from './prompt';
 
 export interface StepDeps {
-  observe(): Promise<{ observation: string; tabs: TabInfo[]; url?: string }>;
+  observe(): Promise<{ observation: string; tabs: TabInfo[]; url?: string; image?: string }>;
   chat(
     messages: ChatMessage[],
     schema: Record<string, unknown>,
@@ -52,6 +52,8 @@ export interface StepOutcome {
   observation: string;
   /** Заметки для сайта, попавшие в промпт. */
   siteNotes: string;
+  /** Скриншот, ушедший модели (data:-адрес). */
+  image?: string;
   /** Сообщения последней попытки — ровно то, что ушло модели. */
   messages: ChatMessage[];
   promptTokensEstimate: number;
@@ -64,13 +66,13 @@ export interface StepOutcome {
 /** Один шаг: наблюдение → запрос к модели → разбор, с переспрашиванием при ошибке формата. */
 export async function runStep(input: StepInput, deps: StepDeps, onEvent: (e: StepEvent) => void = () => {}): Promise<StepOutcome> {
   onEvent({ phase: 'observe' });
-  const { observation, tabs, url } = await deps.observe();
+  const { observation, tabs, url, image } = await deps.observe();
   const siteNotes = url && input.siteNotesFor ? input.siteNotesFor(url) : '';
-  const messages = buildStepMessages({ ...input, observation, tabs, siteNotes });
+  const messages = buildStepMessages({ ...input, observation, tabs, siteNotes, image });
   const schema = agentResponseSchema(input.maxActions);
   const promptTokensEstimate = estimateTokens(messages);
 
-  const outcome: StepOutcome = { observation, siteNotes, messages, promptTokensEstimate, attempts: [], warnings: [] };
+  const outcome: StepOutcome = { observation, siteNotes, image, messages, promptTokensEstimate, attempts: [], warnings: [] };
   if (promptTokensEstimate + input.maxOutputTokens > input.contextTokens) {
     outcome.warnings.push(
       `Промпт ~${promptTokensEstimate} токенов + ответ ${input.maxOutputTokens} больше бюджета контекста ${input.contextTokens} — уменьшите лимит наблюдения или увеличьте контекст.`,

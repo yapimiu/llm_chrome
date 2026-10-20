@@ -6,6 +6,7 @@ import {
   saveSettings,
   type AgentSettings,
   type LlmProfile,
+  type NotifySettings,
   type SafetySettings,
   type ProfileId,
   type Settings,
@@ -82,6 +83,8 @@ export function App() {
     update((s) => ({ ...s, agent: { ...s.agent, [key]: value } }));
   const setSafety = <K extends keyof SafetySettings>(key: K, value: SafetySettings[K]) =>
     update((s) => ({ ...s, safety: { ...s.safety, [key]: value } }));
+  const setNotify = <K extends keyof NotifySettings>(key: K, value: NotifySettings[K]) =>
+    update((s) => ({ ...s, notify: { ...s.notify, [key]: value } }));
   const setRule = (key: keyof RiskRules, value: string) => setSafety('rules', { ...settings.safety.rules, [key]: value });
   const setNote = <K extends keyof Settings['siteNotes'][number]>(i: number, key: K, value: Settings['siteNotes'][number][K]) =>
     update((s) => ({ ...s, siteNotes: s.siteNotes.map((n, j) => (j === i ? { ...n, [key]: value } : n)) }));
@@ -225,6 +228,12 @@ export function App() {
             onChange={(v) => setProfile('thinking', v)}
           />
           <CheckField
+            label="Модель видит картинки"
+            hint="Gemini, Qwen2.5-VL, Gemma 3, llava и т.п. Тогда агент может прикладывать скриншот с номерами элементов (см. «Скриншоты» в разделе «Агент»). У llama-server нужен --mmproj"
+            checked={profile.vision}
+            onChange={(v) => setProfile('vision', v)}
+          />
+          <CheckField
             label="Использовать этот профиль по умолчанию"
             checked={settings.activeProfile === tab}
             onChange={(v) => v && update((s) => ({ ...s, activeProfile: tab }))}
@@ -262,6 +271,14 @@ export function App() {
             onChange={(v) => setAgent('skipAgentSteps', v)}
           />
           <NumberField label="Пауза между буквами при вводе по буквам, мс" value={settings.agent.typeDelayMs} min={0} max={1000} onChange={(v) => setAgent('typeDelayMs', v)} />
+          <label class="field">
+            <span>Скриншоты с номерами элементов (если модель видит картинки)</span>
+            <select value={settings.agent.screenshots} onChange={(e) => setAgent('screenshots', e.currentTarget.value as AgentSettings['screenshots'])}>
+              <option value="off">никогда</option>
+              <option value="stuck">когда агент застрял (шаг не удался или ничего не изменил)</option>
+              <option value="always">на каждом шаге</option>
+            </select>
+          </label>
           <NumberField
             label="Лимит наблюдения, символов"
             value={settings.agent.maxObservationChars}
@@ -417,6 +434,24 @@ export function App() {
       </section>
 
       <section class="card">
+        <h2>Уведомления в Telegram</h2>
+        <p class="muted" style={{ margin: 0 }}>
+          Запросы подтверждения приходят с кнопками «Выполнить / Отклонить», на вопросы агента можно ответить реплаем — ночью не надо подходить к компьютеру.
+          Бота создайте у <a href="https://t.me/BotFather" target="_blank" rel="noreferrer">@BotFather</a> (/newbot), вставьте токен, напишите своему боту
+          любое сообщение и нажмите «Найти chat id». Ответы принимаются только из этого чата.
+        </p>
+        <div class="grid">
+          <TextField label="Токен бота" type="password" value={settings.notify.botToken} placeholder="123456:ABC-DEF…" onChange={(v) => setNotify('botToken', v)} />
+          <TextField label="Chat id" value={settings.notify.chatId} placeholder="123456789" onChange={(v) => setNotify('chatId', v)} />
+        </div>
+        <div class="row" style={{ gap: '16px' }}>
+          <CheckField label="Включить" checked={settings.notify.telegram} onChange={(v) => setNotify('telegram', v)} />
+          <CheckField label="Сообщать итог задачи" checked={settings.notify.onFinish} onChange={(v) => setNotify('onFinish', v)} />
+          <TelegramTester botToken={settings.notify.botToken} chatId={settings.notify.chatId} onChatId={(id) => setNotify('chatId', id)} />
+        </div>
+      </section>
+
+      <section class="card">
         <h2>Логирование</h2>
         <CheckField
           label="Отправлять лог шагов POST-запросом"
@@ -451,6 +486,35 @@ export function App() {
         </span>
       </div>
     </main>
+  );
+}
+
+/** «Найти chat id» и тестовое сообщение — по настройкам на экране, ещё до сохранения. */
+function TelegramTester({ botToken, chatId, onChatId }: { botToken: string; chatId: string; onChatId: (id: string) => void }) {
+  const [state, setState] = useState<{ kind: 'idle' | 'busy' | 'ok' | 'err'; text?: string }>({ kind: 'idle' });
+  const run = async (p: ReturnType<typeof sendToBackground>, ok: (v: unknown) => string) => {
+    setState({ kind: 'busy' });
+    const res = await p;
+    setState(res.ok ? { kind: 'ok', text: ok(res.value) } : { kind: 'err', text: res.error });
+  };
+  return (
+    <>
+      <button
+        disabled={!botToken || state.kind === 'busy'}
+        onClick={() =>
+          void run(sendToBackground({ type: 'bg:telegram-chat-id', botToken }), (id) => {
+            onChatId(String(id));
+            return `Найден chat id ${String(id)} — не забудьте сохранить`;
+          })
+        }
+      >
+        Найти chat id
+      </button>
+      <button disabled={!botToken || !chatId || state.kind === 'busy'} onClick={() => void run(sendToBackground({ type: 'bg:telegram-test', config: { botToken, chatId } }), () => 'Сообщение отправлено')}>
+        Отправить тест
+      </button>
+      {state.text && <span class={state.kind === 'err' ? 'err' : 'ok'}>{state.text}</span>}
+    </>
   );
 }
 

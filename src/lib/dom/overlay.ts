@@ -61,7 +61,7 @@ export class DebugOverlay {
       .box { position: fixed; box-sizing: border-box; border: 2px solid var(--c); border-radius: 3px; }
       .label {
         position: absolute; top: -2px; left: -2px; transform: translateY(-100%);
-        background: var(--c); color: #fff; font: 600 11px/1.2 ui-monospace, Menlo, monospace;
+        background: var(--c); color: #fff; font: 700 13px/1.2 ui-monospace, Menlo, monospace;
         padding: 1px 3px; border-radius: 3px 3px 3px 0; white-space: nowrap;
       }
       .box.low .label { transform: none; border-radius: 0 0 3px 0; }

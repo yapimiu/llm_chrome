@@ -4,3 +4,4 @@ dist
 web-ext.config.ts
 *.log
 .DS_Store
+.cache/

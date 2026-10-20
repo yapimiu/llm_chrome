@@ -1,6 +1,6 @@
 import type { ChatDelta, ChatMessage, ChatResult } from '../llm/client';
 import { describeError, isTransientError } from '../llm/client';
-import { formatAction, type AgentAction } from './actions';
+import { formatAction, targetIndex, type AgentAction } from './actions';
 import { buildHistory } from './history';
 import { actionSignature, fingerprint, LoopDetector, pageSignature } from './loop';
 import { elementLine, type TabInfo } from './prompt';
@@ -41,10 +41,25 @@ export interface RunConfig {
   approvalWindowSec: number;
   /** Столько шагов подряд без пользы на одном месте — и агент сам прокручивает вниз (0 — выкл). */
   autoScrollAfter: number;
+  /** Скриншот с номерами элементов: никогда, когда агент застрял, или на каждом шаге (только для моделей со зрением). */
+  screenshots?: ScreenshotMode;
+}
+
+export type ScreenshotMode = 'off' | 'stuck' | 'always';
+
+/** Прошлый шаг ничего не дал — пора показать модели картинку: текста ей не хватило. */
+export function needsScreenshot(mode: ScreenshotMode | undefined, prev: StepRecord | undefined): boolean {
+  if (mode === 'always') return true;
+  if (mode !== 'stuck' || !prev) return false;
+  if (prev.error || prev.warnings.some((w) => w.startsWith('LOOP'))) return true;
+  if (prev.notes.some((n) => /^(AUTO-SCROLL|STUCK|The user rejected)/.test(n))) return true;
+  return prev.actions.some((a) => (a.result && !a.result.ok) || /nothing on the page changed/.test(a.result?.message ?? ''));
 }
 
 export interface Observation {
   observation: string;
+  /** Скриншот с номерами элементов (data:-адрес), если просили. */
+  image?: string;
   tabs: TabInfo[];
   /** Где искать элементы по номерам (фреймы и снимки) — чтобы исполнитель не перепутал номера. */
   handle: ObservationHandle;
@@ -52,7 +67,7 @@ export interface Observation {
 }
 
 export interface RunDeps {
-  observe(): Promise<Observation>;
+  observe(opts?: { screenshot: boolean }): Promise<Observation>;
   chat(
     messages: ChatMessage[],
     schema: Record<string, unknown>,
@@ -95,7 +110,7 @@ export function serviceBackoffMs(n: number): number {
 type StepResult = 'ok' | 'model-error' | 'service-error';
 
 /** Безопасные действия, которые не требуют одобрения даже в пошаговом режиме. */
-const NO_APPROVAL: ReadonlySet<AgentAction['action']> = new Set(['done', 'ask_user', 'extract', 'wait', 'scroll']);
+const NO_APPROVAL: ReadonlySet<AgentAction['action']> = new Set(['done', 'ask_user', 'extract', 'wait', 'wait_for', 'scroll', 'hover']);
 
 /** Столько шагов подряд, упёршихся в отложенное или запрещённое, — и запуск завершается. */
 export const MAX_DEFER_STREAK = 3;
@@ -350,8 +365,8 @@ export class AgentRunner {
         },
         {
           observe: async () => {
-            obs = await this.deps.observe();
-            return { observation: obs.observation, tabs: obs.tabs, url: obs.url };
+            obs = await this.deps.observe({ screenshot: needsScreenshot(this.cfg.screenshots, this.state.steps.at(-1)) });
+            return { observation: obs.observation, tabs: obs.tabs, url: obs.url, image: obs.image };
           },
           chat: (messages, schema, onDelta, onRetry) => this.deps.chat(messages, schema, onDelta, onRetry, this.abort.signal),
         },
@@ -388,10 +403,12 @@ export class AgentRunner {
 
     record.reasoning = outcome.step.reasoning;
     record.expectedOutcome = outcome.step.expected_outcome;
-    record.actions = outcome.step.actions.map((action) => ({
-      action,
-      target: 'index' in action ? elementLine(seen.observation, action.index) : undefined,
-    }));
+    record.actions = outcome.step.actions.map((action) => {
+      const i = targetIndex(action);
+      const ex: ExecutedAction = { action, target: i !== undefined ? elementLine(seen.observation, i) : undefined };
+      if (action.action === 'drag') ex.toTarget = elementLine(seen.observation, action.to_index);
+      return ex;
+    });
 
     const verdict = this.loop.record(actionSignature(record.actions), fingerprint(pageSignature(seen.observation)));
     if (verdict === 'warn') {
@@ -413,11 +430,13 @@ export class AgentRunner {
     const policy = sitePolicyFor(seen.url, this.cfg.siteNotes);
     const flags = seen.handle.flags ?? {};
     for (const ex of record.actions) {
+      const i = targetIndex(ex.action);
       const risk = assessAction({
         action: ex.action,
         target: ex.target,
-        flags: 'index' in ex.action ? (flags[ex.action.index] ?? []) : [],
-        formSubmit: 'index' in ex.action ? seen.handle.formSubmit?.[ex.action.index] : undefined,
+        toTarget: ex.toTarget,
+        flags: i !== undefined ? (flags[i] ?? []) : [],
+        formSubmit: i !== undefined ? seen.handle.formSubmit?.[i] : undefined,
         url: seen.url,
         modelFlag: outcome.step.risky === true,
         rules: this.cfg.riskRules,
@@ -649,6 +668,7 @@ export class AgentRunner {
       observation: obs?.observation ?? '',
       history,
       siteNotes: outcome?.siteNotes || undefined,
+      screenshot: outcome?.image,
       responses: outcome?.attempts.map((a) => ({ content: a.content, reasoning: a.reasoning, parseError: a.parseError })) ?? [],
     };
     await this.deps.persistStep(this.state, record, detail).catch(() => {});

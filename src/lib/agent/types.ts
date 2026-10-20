@@ -66,6 +66,8 @@ export interface ExecutedAction {
   action: AgentAction;
   /** Строка элемента из наблюдения: `button "Войти"` — для ленты и истории. */
   target?: string;
+  /** drag: строка элемента, на который перетаскиваем. */
+  toTarget?: string;
   result?: ActionResult;
   skipped?: string;
   /** Почему действие сочтено рискованным (см. lib/agent/risk.ts). */
@@ -107,6 +109,8 @@ export interface StepDetail {
   history: string;
   /** Заметки для сайта, попавшие в промпт этого шага. */
   siteNotes?: string;
+  /** Скриншот, который видела модель (data:-адрес JPEG). */
+  screenshot?: string;
   responses: { content: string; reasoning: string; parseError?: string }[];
 }
 

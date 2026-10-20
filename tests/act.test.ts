@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { findClickPoint, NO_EFFECT_NOTE, performAndSettle, performDomAction, readFieldValue, selectFieldContent, setNativeValue, valueHasText, type ActContext } from '@/lib/dom/act';
+import { findClickPoint, NO_EFFECT_NOTE, performAndSettle, performDomAction, readFieldValue, selectFieldContent, scrollableAncestor, setNativeValue, valueHasText, waitForText, type ActContext } from '@/lib/dom/act';
 import type { Geometry } from '@/lib/dom/geometry';
 import type { RegistryEntry } from '@/lib/dom/collect';
 import { waitForStable } from '@/lib/dom/stable';
@@ -308,3 +308,53 @@ describe('редактор кода без CDP', () => {
   });
 });
 
+
+describe('новые действия без CDP', () => {
+  it('hover: события наведения открывают меню', () => {
+    document.body.innerHTML = '<button>Меню</button><ul hidden>пункты</ul>';
+    const button = document.querySelector('button')!;
+    const seen: string[] = [];
+    for (const t of ['pointerover', 'mouseover', 'mouseenter', 'mousemove']) button.addEventListener(t, () => seen.push(t));
+    expect(performDomAction({ action: 'hover', index: 1 }, ctxFor(button))).toMatchObject({ ok: true, message: 'hovered' });
+    expect(seen).toEqual(['pointerover', 'mouseover', 'mouseenter', 'mousemove']);
+  });
+
+  it('press_key: клавиша уходит в элемент с фокусом, Tab переносит фокус', () => {
+    document.body.innerHTML = '<input id="a"><input id="b">';
+    const a = document.querySelector<HTMLInputElement>('#a')!;
+    a.focus();
+    const keys: string[] = [];
+    a.addEventListener('keydown', (e) => keys.push(e.key));
+    performDomAction({ action: 'press_key', key: 'Escape' }, ctxFor());
+    expect(keys).toEqual(['Escape']);
+    performDomAction({ action: 'press_key', key: 'Tab' }, ctxFor());
+    expect(document.activeElement?.id).toBe('b');
+    performDomAction({ action: 'press_key', key: 'Shift+Tab' }, ctxFor());
+    expect(document.activeElement?.id).toBe('a');
+  });
+
+  it('drag без CDP — понятный отказ', () => {
+    document.body.innerHTML = '<div>a</div><div>b</div>';
+    const [a, b] = Array.from(document.querySelectorAll('div'));
+    expect(performDomAction({ action: 'drag', index: 1, to_index: 2 }, ctxFor(a!, b!)).message).toMatch(/CDP/);
+  });
+
+  it('scroll с index прокручивает область элемента, а не страницу', () => {
+    document.body.innerHTML = '<div id="box" style="overflow-y: auto; height: 100px"><p>строка</p></div>';
+    const box = document.querySelector<HTMLElement>('#box')!;
+    Object.defineProperty(box, 'scrollHeight', { value: 1000 });
+    Object.defineProperty(box, 'clientHeight', { value: 100 });
+    box.scrollBy = ((opts: ScrollToOptions) => (box.scrollTop += opts.top ?? 0)) as typeof box.scrollBy;
+    const p = box.querySelector('p')!;
+    const r = performDomAction({ action: 'scroll', direction: 'down', amount: 1, index: 1 }, ctxFor(p));
+    expect(r.message).toMatch(/scrolled the area down by 80px/);
+    expect(scrollableAncestor(p)).toBe(box);
+  });
+
+  it('wait_for: ждёт появления текста и сдаётся по таймауту', async () => {
+    document.body.innerHTML = '<p>Загрузка…</p>';
+    setTimeout(() => (document.body.innerHTML += '<p>Заказ   ГОТОВ</p>'), 50);
+    expect(await waitForText(document, 'заказ готов', 2000, 10)).toMatchObject({ ok: true });
+    expect(await waitForText(document, 'нет такого', 50, 10)).toMatchObject({ ok: false });
+  });
+});

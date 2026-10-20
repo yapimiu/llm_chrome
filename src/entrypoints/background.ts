@@ -5,6 +5,8 @@ import { resumeTask, sameUrl, type RunCheckpoint } from '@/lib/agent/queue';
 import { assessAction, sitePolicyFor } from '@/lib/agent/risk';
 import { Skipper, type SkipState } from '@/lib/agent/skipper';
 import { Course, type CourseState, type SolveResult } from '@/lib/agent/course';
+import { handoffTask, macroFromRun, Replayer, type Macro, type ReplayState } from '@/lib/agent/macro';
+import { deleteMacro, getMacro, listMacros, saveMacro } from '@/lib/agent/macro-store';
 import { hiddenNamesFor, nextRulesFor, type SiteNote } from '@/lib/agent/site-notes';
 import { AgentRunner, type Observation, type RunConfig } from '@/lib/agent/runner';
 import type { StepEvent } from '@/lib/agent/step';
@@ -31,7 +33,11 @@ import { postLog } from '@/lib/log/remote';
 import { isBackgroundRequest, type BackgroundRequest, type Result, type RunInfo, type UiEvent } from '@/lib/messages';
 import { DebuggerSessions } from '@/lib/exec/debugger';
 import { activeTab, isRestrictedUrl, observePage, setHighlight } from '@/lib/perception';
+import { captureTab } from '@/lib/screenshot';
+import { discoverChatId, isConfigured, TelegramBridge, TelegramClient } from '@/lib/notify/telegram';
+import { approvalText, finishText, questionText } from '@/lib/notify/format';
 import { activeProfile, loadSettings, type ProfileId, type Settings } from '@/lib/settings';
+import { targetIndex } from '@/lib/agent/actions';
 import { executeAction, normalizeNavigateUrl, waitForTabLoad, type AgentTab, type ExecContext } from '@/lib/tab-actions';
 
 let current: { runner: AgentRunner; tab: AgentTab; finished: Promise<RunState> } | null = null;
@@ -80,7 +86,7 @@ function throttledProgress(): (e: StepEvent) => void {
   };
 }
 
-async function observeAgentTab(tab: AgentTab, maxChars: number, highlight: boolean, siteNotes: SiteNote[]): Promise<Observation> {
+async function observeAgentTab(tab: AgentTab, maxChars: number, highlight: boolean, siteNotes: SiteNote[], screenshot = false): Promise<Observation> {
   const t = await browser.tabs.get(tab.tabId).catch(() => null);
   if (!t) throw new Error('Вкладка, в которой работал агент, закрыта.');
   const tabs: TabInfo[] = (await browser.tabs.query({ windowId: tab.windowId }))
@@ -96,8 +102,69 @@ async function observeAgentTab(tab: AgentTab, maxChars: number, highlight: boole
       url,
     };
   }
-  const obs = await observePage(tab.tabId, url, { maxChars, highlight, hide: hiddenNamesFor(url, siteNotes), next: nextRulesFor(url, siteNotes) });
-  return { observation: obs.text, tabs, handle: obs.handle, url };
+  // Для скриншота рамки с номерами нужны на экране — модель сопоставит картинку с номерами из текста.
+  const obs = await observePage(tab.tabId, url, { maxChars, highlight: highlight || screenshot, hide: hiddenNamesFor(url, siteNotes), next: nextRulesFor(url, siteNotes) });
+  let image: string | undefined;
+  if (screenshot) {
+    image = (await captureTab(tab.tabId)) ?? undefined;
+    if (!highlight) await setHighlight(tab.tabId, url, false).catch(() => {});
+  }
+  return { observation: obs.text, image, tabs, handle: obs.handle, url };
+}
+
+// ——— Telegram ———
+
+function telegramClient(settings: Settings): TelegramClient | null {
+  const n = settings.notify;
+  return n.telegram && isConfigured(n) ? new TelegramClient(n) : null;
+}
+
+/** Сигнал человеку: звук и уведомление в браузере, плюс сообщение в Telegram, если он настроен. */
+async function notifyHuman(settings: Settings, title: string, message: string): Promise<void> {
+  const tg = telegramClient(settings);
+  await Promise.all([
+    alertHuman(title, message, settings.safety.sound),
+    tg?.send(`🔔 ${title}\n\n${message}`).catch((err: unknown) => console.warn('telegram failed', err)),
+  ]);
+}
+
+/**
+ * Дублирует запросы агента в Telegram: подтверждение — кнопками, вопрос — реплаем, итог — сообщением.
+ * Ответ из чата идёт в runner так же, как из панели; ответили в панели — сообщение в чате помечается.
+ */
+function telegramSync(settings: Settings, runner: () => AgentRunner, url: () => Promise<string>): ((state: RunState) => void) | null {
+  const client = telegramClient(settings);
+  if (!client) return null;
+  const bridge = new TelegramBridge(client);
+  const asked = new Set<string>();
+  let finished = false;
+  const warn = (err: unknown) => console.warn('telegram failed', err);
+  return (state) => {
+    const approvalKey = `${state.id.slice(0, 8)}:${state.steps.length}`;
+    const questionKey = `${approvalKey}:q`;
+    for (const key of [...asked]) {
+      const still = (key === approvalKey && state.status === 'awaiting_approval') || (key === questionKey && state.status === 'asking_user');
+      if (!still) {
+        asked.delete(key);
+        void bridge.cancel(key, '☑️ Отвечено в браузере').catch(warn);
+      }
+    }
+    if (state.status === 'awaiting_approval' && state.pendingApproval && !asked.has(approvalKey)) {
+      asked.add(approvalKey);
+      void url()
+        .then((u) => bridge.askApproval(approvalKey, approvalText(state, u), (ok) => runner().approve(ok)))
+        .catch(warn);
+    }
+    if (state.status === 'asking_user' && state.question !== undefined && !asked.has(questionKey)) {
+      asked.add(questionKey);
+      void bridge.askQuestion(questionKey, questionText(state), (text) => runner().answer(text)).catch(warn);
+    }
+    if (TERMINAL_STATUSES.has(state.status) && !finished) {
+      finished = true;
+      bridge.stop();
+      if (settings.notify.onFinish) void client.send(finishText(state)).catch(warn);
+    }
+  };
 }
 
 function runConfig(settings: Settings, task: string, overrides: Partial<RunConfig> = {}): RunConfig {
@@ -120,6 +187,7 @@ function runConfig(settings: Settings, task: string, overrides: Partial<RunConfi
     autonomous: settings.agent.autonomous,
     riskRules: settings.safety.rules,
     approvalWindowSec: settings.safety.approvalWindowSec,
+    screenshots: profile.vision ? settings.agent.screenshots : 'off',
     ...overrides,
   };
 }
@@ -151,13 +219,19 @@ async function launch(settings: Settings, profileId: ProfileId, cfg: RunConfig, 
     await saveCheckpoint({ runId: state.id, cfg: cfgToSave, profileId, tab: { ...tab, url }, savedAt: Date.now() });
   };
 
+  const tabUrl = async () => (await browser.tabs.get(tab.tabId).catch(() => null))?.url ?? '';
+  const telegram = telegramSync(settings, () => runner, tabUrl);
+
   const runner: AgentRunner = new AgentRunner(
     cfg,
     {
-      observe: () => observeAgentTab(tab, settings.agent.maxObservationChars, settings.agent.debugOverlay, cfg.siteNotes),
+      observe: (opts) => observeAgentTab(tab, settings.agent.maxObservationChars, settings.agent.debugOverlay, cfg.siteNotes, opts?.screenshot ?? false),
       chat: (messages, schema, onDelta, onRetry, signal) => chatStream({ profile, messages, schema, onDelta, onRetry, signal }),
       execute: (action, handle) => executeAction(action, handle, exec),
-      onState: (state) => broadcast({ type: 'ui:run-state', info: { state, interrupted: false } }),
+      onState: (state) => {
+        broadcast({ type: 'ui:run-state', info: { state, interrupted: false } });
+        telegram?.(state);
+      },
       onProgress: progress,
       persistRun: async (state) => {
         await saveRun(state);
@@ -188,6 +262,7 @@ async function launch(settings: Settings, profileId: ProfileId, cfg: RunConfig, 
         await addDeferred(item);
         broadcast({ type: 'ui:queue-changed' });
       },
+      // В Telegram запрос подтверждения уходит с кнопками (telegramSync) — здесь только звук и уведомление.
       alert: (message) => {
         void alertHuman('Агенту нужно подтверждение', message, settings.safety.sound);
       },
@@ -306,7 +381,7 @@ async function startSkip(windowId: number): Promise<void> {
         if (course) course.state = state;
         broadcast({ type: 'ui:skip-state', state });
       },
-      alert: (message) => void alertHuman('Пролистывание курса остановилось', message, settings.safety.sound),
+      alert: (message) => void notifyHuman(settings, 'Пролистывание курса остановилось', message),
     },
     { withAgent: settings.agent.skipWithAgent, maxAgentPerPage: 2 },
   );
@@ -317,7 +392,105 @@ async function startSkip(windowId: number): Promise<void> {
 
 const skipRunning = () => course?.state.status === 'running';
 
+// ——— сценарии: запись запуска и повтор без модели ———
+
+type ReplayReply = { approved?: boolean; text?: string | null };
+let replay: { replayer: Replayer; macro: Macro; state: ReplayState; waiter: ((r: ReplayReply) => void) | null } | null = null;
+const replayRunning = () => replay?.state.status === 'running';
+
+async function saveRunAsMacro(runId: string, name: string): Promise<Macro> {
+  const run = await loadRun(runId);
+  if (!run) throw new Error('Запуск не найден в журнале.');
+  const observations = new Map<number, string>();
+  for (const s of run.steps) {
+    const d = await getStepDetail(runId, s.n).catch(() => undefined);
+    if (d) observations.set(s.n, d.observation);
+  }
+  const macro = macroFromRun(run, observations, name, crypto.randomUUID(), Date.now());
+  if (macro.steps.length === 0) throw new Error('В этом запуске нет выполненных действий — сохранять нечего.');
+  await saveMacro(macro);
+  broadcast({ type: 'ui:macros-changed' });
+  return macro;
+}
+
+const sameHost = (a: string, b: string) => {
+  try {
+    return new URL(a).host === new URL(b).host;
+  } catch {
+    return false;
+  }
+};
+
+async function startReplay(id: string, windowId: number): Promise<void> {
+  ensureIdle();
+  const macro = await getMacro(id);
+  if (!macro) throw new Error('Сценарий не найден.');
+  const s = await loadSettings();
+  const active = await activeTab(windowId);
+  const tab: AgentTab = { tabId: active.id, windowId };
+  // Другой сайт — сначала открываем страницу, с которой сценарий начинался.
+  const start = normalizeNavigateUrl(macro.startUrl);
+  if (start && !sameHost(active.url ?? '', start)) {
+    await browser.tabs.update(tab.tabId, { url: start });
+    await waitForTabLoad(tab.tabId);
+  }
+  const debuggers = s.agent.useDebugger ? new DebuggerSessions() : null;
+  const exec: ExecContext = {
+    tab,
+    cdp: debuggers ? (tabId) => debuggers.driverFor(tabId) : undefined,
+    cdpUnavailable: () => debuggers?.unavailableReason ?? '',
+    showCursor: s.agent.showCursor,
+    typing: { byKeys: s.agent.typeByKeys, delayMs: s.agent.typeDelayMs },
+  };
+  const waitReply = () => new Promise<ReplayReply>((resolve) => replay && (replay.waiter = resolve));
+  const replayer = new Replayer(macro, {
+    observe: async () => {
+      const obs = await observeAgentTab(tab, s.agent.maxObservationChars, false, s.siteNotes);
+      return { url: obs.url, elements: obs.handle.elements ?? [], handle: obs.handle };
+    },
+    execute: (action, handle) => executeAction(action, handle, exec),
+    assess: (action, target, toTarget, obs) => {
+      const i = targetIndex(action);
+      return assessAction({
+        action,
+        target,
+        toTarget,
+        flags: i !== undefined ? (obs.handle.flags?.[i] ?? []) : [],
+        formSubmit: i !== undefined ? obs.handle.formSubmit?.[i] : undefined,
+        url: obs.url,
+        modelFlag: false,
+        rules: s.safety.rules,
+        policy: sitePolicyFor(obs.url, s.siteNotes),
+      });
+    },
+    confirm: async (text) => {
+      void notifyHuman(s, 'Повтор сценария ждёт подтверждения', text);
+      return (await waitReply()).approved === true;
+    },
+    ask: async () => (await waitReply()).text ?? null,
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    onState: (state) => {
+      if (replay) replay.state = state;
+      broadcast({ type: 'ui:macro-state', state });
+    },
+  });
+  replay = { replayer, macro, state: replayer.state, waiter: null };
+  const stopKeepAlive = startKeepAlive();
+  void replayer.run().finally(() => {
+    stopKeepAlive();
+    void debuggers?.detachAll();
+  });
+}
+
+function stopReplay(): void {
+  if (!replay) return;
+  replay.replayer.stop();
+  replay.waiter?.({ approved: false, text: null });
+  replay.waiter = null;
+}
+
 function ensureIdle(): void {
+  if (replayRunning()) throw new Error('Идёт повтор сценария — сначала остановите его.');
   if (skipRunning()) throw new Error('Идёт пролистывание — сначала остановите его.');
   if (current && !TERMINAL_STATUSES.has(current.runner.state.status)) throw new Error('Агент уже работает — остановите текущую задачу.');
   if (interrupted) throw new Error('Есть прерванная задача — продолжите или отмените её в панели.');
@@ -443,6 +616,13 @@ async function handle(msg: BackgroundRequest): Promise<Result<unknown>> {
       const page = await observePage(tab.id, tab.url, { maxChars: settings.agent.maxObservationChars, highlight: msg.highlight, hide, next });
       return { ok: true, value: { text: page.text, stats: page.stats } };
     }
+    case 'bg:screenshot': {
+      const tab = await activeTab(msg.windowId);
+      const settings = await loadSettings();
+      const obs = await observeAgentTab({ tabId: tab.id, windowId: msg.windowId }, settings.agent.maxObservationChars, settings.agent.debugOverlay, settings.siteNotes, true);
+      if (!obs.image) throw new Error('Не удалось снять экран: вкладка не активна или страница закрыта для расширений.');
+      return { ok: true, value: obs.image };
+    }
     case 'bg:highlight': {
       const tab = await activeTab(msg.windowId);
       await setHighlight(tab.id, tab.url, msg.enabled);
@@ -491,6 +671,44 @@ async function handle(msg: BackgroundRequest): Promise<Result<unknown>> {
       return { ok: true, value: null };
     case 'bg:skip-get':
       return { ok: true, value: course?.state ?? null };
+    case 'bg:macro-save':
+      return { ok: true, value: await saveRunAsMacro(msg.runId, msg.name) };
+    case 'bg:macro-list':
+      return { ok: true, value: await listMacros() };
+    case 'bg:macro-delete':
+      await deleteMacro(msg.id);
+      broadcast({ type: 'ui:macros-changed' });
+      return { ok: true, value: null };
+    case 'bg:macro-run':
+      await startReplay(msg.id, msg.windowId);
+      return { ok: true, value: null };
+    case 'bg:macro-stop':
+      stopReplay();
+      return { ok: true, value: null };
+    case 'bg:macro-get':
+      return { ok: true, value: replay?.state ?? null };
+    case 'bg:macro-reply': {
+      const w = replay?.waiter;
+      if (!w) throw new Error('Повтор ничего не ждёт.');
+      replay!.waiter = null;
+      w({ approved: msg.approved, text: msg.text });
+      return { ok: true, value: null };
+    }
+    case 'bg:macro-handoff': {
+      if (!replay || replay.state.status === 'running') throw new Error('Нет остановившегося повтора.');
+      const task = handoffTask(replay.macro, replay.state);
+      return { ok: true, value: await startRun(msg.windowId, task) };
+    }
+    case 'bg:telegram-test': {
+      const client = new TelegramClient(msg.config);
+      await client.send('✅ Связь с агентом есть. Сюда будут приходить запросы подтверждения и вопросы.');
+      return { ok: true, value: null };
+    }
+    case 'bg:telegram-chat-id': {
+      const id = await discoverChatId(new TelegramClient({ botToken: msg.botToken, chatId: '' }));
+      if (!id) throw new Error('Боту ещё никто не писал: откройте бота в Telegram, нажмите «Start» или отправьте любое сообщение и повторите.');
+      return { ok: true, value: id };
+    }
     case 'bg:alert-test': {
       const settings = await loadSettings();
       await alertHuman('Проверка сигнала', 'Так агент позовёт вас, когда ночью упрётся в рискованное действие.', settings.safety.sound);

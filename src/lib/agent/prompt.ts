@@ -1,4 +1,4 @@
-import type { ChatMessage } from '../llm/client';
+import { imageCount, messageText, type ChatMessage } from '../llm/client';
 
 export interface TabInfo {
   id: number;
@@ -21,6 +21,8 @@ export interface StepPromptInput {
   history?: string;
   /** Заметки пользователя для текущего сайта. */
   siteNotes?: string;
+  /** Скриншот видимой части страницы с номерами элементов (data:-адрес) — для моделей со зрением. */
+  image?: string;
 }
 
 const MAX_TABS = 12;
@@ -67,10 +69,12 @@ export function buildStepMessages(input: StepPromptInput): ChatMessage[] {
   if (input.siteNotes?.trim()) {
     parts.push(`SITE NOTES (from the user, about this website — they override your own guesses):\n${input.siteNotes.trim()}`);
   }
+  if (input.image) parts.push('SCREENSHOT: attached below — the visible part of the page; boxes with numbers are the [index] of elements from PAGE STATE.');
   parts.push('Reply with the JSON object for the next step.');
+  const text = parts.join('\n\n');
   return [
     { role: 'system', content: system },
-    { role: 'user', content: parts.join('\n\n') },
+    { role: 'user', content: input.image ? [{ type: 'text', text }, { type: 'image_url', image_url: { url: input.image } }] : text },
   ];
 }
 
@@ -83,9 +87,13 @@ export function correctionMessage(error: string, truncated: boolean): ChatMessag
   };
 }
 
-/** Грубая оценка токенов: ~3 символа на токен для смеси кириллицы, латиницы и разметки. */
+/** Сколько токенов в среднем стоит скриншот ~1280×800 у визуальных моделей. */
+export const IMAGE_TOKENS = 1000;
+
+/** Грубая оценка токенов: ~3 символа на токен для смеси кириллицы, латиницы и разметки; картинка — IMAGE_TOKENS. */
 export function estimateTokens(messages: readonly ChatMessage[]): number {
-  return Math.ceil(messages.reduce((n, m) => n + m.content.length + 8, 0) / 3);
+  const text = messages.reduce((n, m) => n + messageText(m).length + 8, 0);
+  return Math.ceil(text / 3) + messages.reduce((n, m) => n + imageCount(m) * IMAGE_TOKENS, 0);
 }
 
 /** Строка элемента из наблюдения по номеру: `[12] button "Войти"` → `button "Войти"`. */
