@@ -251,10 +251,10 @@ describe('профиль «Облако» в настройках', () => {
 
   it('старые настройки без поля provider получают значение по умолчанию, мусор отбрасывается', () => {
     const s = sanitizeSettings({ profiles: { fast: { model: 'qwen3:14b' }, cloud: { provider: 'нет такого', apiKey: ' k ' } } });
-    expect(s.profiles.fast.provider).toBe('openai');
-    expect(s.profiles.cloud.provider).toBe('google');
-    expect(s.profiles.cloud.apiKey).toBe('k');
-    expect(sanitizeSettings({ profiles: { slow: { provider: 'google' } } }).profiles.slow.provider).toBe('google');
+    expect(s.profiles.fast?.provider).toBe('openai');
+    expect(s.profiles.cloud?.provider).toBe('google');
+    expect(s.profiles.cloud?.apiKey).toBe('k');
+    expect(sanitizeSettings({ profiles: { slow: { provider: 'google' } } }).profiles.slow?.provider).toBe('google');
   });
 
   it('профиль можно выбрать активным', () => {

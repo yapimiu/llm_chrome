@@ -64,3 +64,22 @@ export function buildHistory(steps: readonly StepRecord[], extracted: readonly s
   const out = [...parts, olderBlock, recent.join('\n')].filter(Boolean).join('\n\n');
   return out.length > opts.maxChars ? `…${out.slice(out.length - opts.maxChars + 1)}` : out;
 }
+
+/**
+ * Короткая сводка вместо истории — «сброс контекста»: заметки из extract целиком, пройденные страницы
+ * и два последних шага. Строится без обращения к модели, поэтому токенов не тратит.
+ */
+export function buildDigest(steps: readonly StepRecord[], extracted: readonly string[], keep = 2, maxChars = DEFAULT_HISTORY.maxChars): string {
+  const parts: string[] = [];
+  if (extracted.length) parts.push(`Saved notes (from extract):\n${extracted.map((e, i) => `${i + 1}. ${e}`).join('\n')}`);
+  if (steps.length === 0) return parts.join('\n\n');
+  const pages = [...new Set(steps.map((s) => cut(s.url, 80)).filter(Boolean))].slice(-6);
+  const failed = steps.filter((s) => s.error || s.actions.some((a) => a.result && !a.result.ok)).length;
+  parts.push(
+    `Earlier context was reset to save space. So far: ${steps.length} steps (${failed} with problems).${pages.length ? ` Pages visited, oldest first: ${pages.join(' → ')}.` : ''}`,
+  );
+  parts.push(steps.slice(-keep).map(compactStep).join('\n'));
+  const out = parts.filter(Boolean).join('\n\n');
+  // Как и история, не длиннее лимита: иначе «сброс» с длинными заметками extract раздул бы промпт.
+  return out.length > maxChars ? `…${out.slice(out.length - maxChars + 1)}` : out;
+}

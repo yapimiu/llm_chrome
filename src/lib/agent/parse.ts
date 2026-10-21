@@ -3,11 +3,13 @@ import {
   DEFAULT_WAIT_FOR_MS,
   KEY_NAMES,
   MAX_WAIT_MS,
+  READ_PACES,
   PAGE_CHANGING_ACTIONS,
   TERMINAL_ACTIONS,
   type ActionName,
   type AgentAction,
   type KeyName,
+  type ReadPace,
   type AgentStep,
 } from './actions';
 
@@ -111,6 +113,9 @@ const ACTION_ALIASES: Record<string, ActionName> = {
   key: 'press_key',
   press: 'press_key',
   keypress: 'press_key',
+  read_text: 'read',
+  read_between: 'read',
+  slow_scroll: 'read',
   drag_and_drop: 'drag',
   drag_drop: 'drag',
   wait_for_text: 'wait_for',
@@ -216,6 +221,16 @@ export function normalizeAction(raw: unknown): ActionResult {
       const amount = Number.isFinite(rawAmount) && rawAmount > 0 ? Math.min(rawAmount, 10) : 1;
       const index = indexOf();
       return { ok: true, action: index !== null && index >= 1 ? { action: name, direction: dir, amount, index } : { action: name, direction: dir, amount } };
+    }
+    case 'read': {
+      const index = indexOf();
+      const to = toInt(pick(r, 'to_index', 'to', 'end', 'end_index', 'until'));
+      const pace = toText(pick(r, 'pace', 'speed', 'mode'))?.toLowerCase();
+      const action: AgentAction = { action: name };
+      if (index !== null && index >= 1) action.index = index;
+      if (to !== null && to >= 1) action.to_index = to;
+      if (pace && (READ_PACES as readonly string[]).includes(pace)) action.pace = pace as ReadPace;
+      return { ok: true, action };
     }
     case 'hover': {
       const index = indexOf();

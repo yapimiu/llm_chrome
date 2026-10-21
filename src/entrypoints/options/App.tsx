@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import {
   DEFAULT_SETTINGS,
+  isExternalProfile,
   loadSettings,
   parseExtraBody,
+  profileOf,
   saveSettings,
   type AgentSettings,
   type LlmProfile,
@@ -42,7 +44,7 @@ const STRUCTURED_LABELS: Record<StructuredOutputMode, string> = {
 
 export function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
-  const [tab, setTab] = useState<ProfileId>('fast');
+  const [tab, setTab] = useState<ProfileId>(DEFAULT_SETTINGS.activeProfile);
   const [saved, setSaved] = useState<'idle' | 'dirty' | 'saved'>('idle');
 
   useEffect(() => {
@@ -59,7 +61,34 @@ export function App() {
     setSaved('dirty');
   };
   const setProfile = <K extends keyof LlmProfile>(key: K, value: LlmProfile[K]) =>
-    update((s) => ({ ...s, profiles: { ...s.profiles, [tab]: { ...s.profiles[tab], [key]: value } } }));
+    update((s) => ({ ...s, profiles: { ...s.profiles, [tab]: { ...profileOf(s, tab), [key]: value } } }));
+
+  /** Новый профиль: копия текущего или заготовка провайдера; сразу открывается на вкладке. */
+  const addProfile = (template: string) => {
+    const id = `m${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
+    const current = profileOf(settings, tab);
+    const info = template === 'copy' ? null : PROVIDERS[template as ProviderId];
+    const fresh: LlmProfile = info
+      ? { ...DEFAULT_SETTINGS.profiles.fast!, label: `Новый (${info.id})`, provider: info.id, baseUrl: info.baseUrl, model: info.model, vision: info.cloud }
+      : { ...current, label: `${current.label} (копия)` };
+    update((s) => ({ ...s, profileIds: [...s.profileIds, id], profiles: { ...s.profiles, [id]: fresh } }));
+    setTab(id);
+  };
+
+  /** Удаляет профиль вместе со ссылками на него (активный, цепочка автосмены); последний не удаляется. */
+  const removeProfile = (id: ProfileId) => {
+    if (settings.profileIds.length <= 1) return;
+    const ids = settings.profileIds.filter((x) => x !== id);
+    const { [id]: _gone, ...rest } = settings.profiles;
+    update((s) => ({
+      ...s,
+      profileIds: ids,
+      profiles: rest,
+      activeProfile: s.activeProfile === id ? ids[0]! : s.activeProfile,
+      escalation: { ...s.escalation, chain: s.escalation.chain.filter((x) => x !== id) },
+    }));
+    if (tab === id) setTab(ids[0]!);
+  };
 
   /**
    * Смена провайдера подставляет его адрес и модель, но только если поле осталось
@@ -67,7 +96,7 @@ export function App() {
    */
   const setProvider = (id: ProviderId) =>
     update((s) => {
-      const p = s.profiles[tab];
+      const p = profileOf(s, tab);
       const from = providerInfo(p.provider);
       const to = PROVIDERS[id];
       const swap = (value: string, a: string, b: string) => (value.trim() === '' || value.trim() === a ? b : value);
@@ -89,33 +118,34 @@ export function App() {
   const setNote = <K extends keyof Settings['siteNotes'][number]>(i: number, key: K, value: Settings['siteNotes'][number][K]) =>
     update((s) => ({ ...s, siteNotes: s.siteNotes.map((n, j) => (j === i ? { ...n, [key]: value } : n)) }));
 
-  const extraBodyError = (Object.keys(settings.profiles) as ProfileId[])
+  const extraBodyError = settings.profileIds
     .map((id) => {
+      const p = profileOf(settings, id);
       try {
-        parseExtraBody(settings.profiles[id].extraBody);
+        parseExtraBody(p.extraBody);
         return null;
       } catch (err) {
-        return `${settings.profiles[id].label}: ${err instanceof Error ? err.message : String(err)}`;
+        return `${p.label}: ${err instanceof Error ? err.message : String(err)}`;
       }
     })
     .find(Boolean);
 
   const onSave = async () => {
     if (extraBodyError) return;
-    const p = settings.profiles;
     const fixed: Settings = {
       ...settings,
-      profiles: {
-        fast: { ...p.fast, baseUrl: normalizeBaseUrl(p.fast.baseUrl) ?? p.fast.baseUrl },
-        slow: { ...p.slow, baseUrl: normalizeBaseUrl(p.slow.baseUrl) ?? p.slow.baseUrl },
-        cloud: { ...p.cloud, baseUrl: normalizeBaseUrl(p.cloud.baseUrl) ?? p.cloud.baseUrl },
-      },
+      profiles: Object.fromEntries(
+        settings.profileIds.map((id) => {
+          const p = profileOf(settings, id);
+          return [id, { ...p, baseUrl: normalizeBaseUrl(p.baseUrl) ?? p.baseUrl }];
+        }),
+      ),
     };
     setSettings(await saveSettings(fixed));
     setSaved('saved');
   };
 
-  const profile = settings.profiles[tab];
+  const profile = profileOf(settings, tab);
   const provider = providerInfo(profile.provider);
   const normalized = normalizeBaseUrl(profile.baseUrl);
   const remote = provider.cloud || (normalized !== null && !isLocalHost(normalized));
@@ -127,12 +157,36 @@ export function App() {
       <section class="card">
         <h2>LLM-профили</h2>
         <div class="tabs" role="tablist">
-          {(Object.keys(settings.profiles) as ProfileId[]).map((id) => (
+          {settings.profileIds.map((id) => (
             <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>
-              {settings.profiles[id].label}
+              {profileOf(settings, id).label}
               {settings.activeProfile === id ? ' • активный' : ''}
             </button>
           ))}
+          <select
+            aria-label="Добавить профиль"
+            value=""
+            onChange={(e) => {
+              if (e.currentTarget.value) addProfile(e.currentTarget.value);
+              e.currentTarget.value = '';
+            }}
+          >
+            <option value="">+ Добавить профиль…</option>
+            <option value="copy">Копия текущего</option>
+            {PROVIDER_IDS.map((id) => (
+              <option key={id} value={id}>
+                Новый: {PROVIDERS[id].label.split(' (')[0]}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            disabled={settings.profileIds.length <= 1}
+            title={settings.profileIds.length <= 1 ? 'Последний профиль удалить нельзя' : 'Удалить этот профиль'}
+            onClick={() => removeProfile(tab)}
+          >
+            Удалить профиль
+          </button>
         </div>
 
         <div class="grid">
@@ -243,6 +297,8 @@ export function App() {
         <ConnectionTester key={tab} profile={profile} />
       </section>
 
+      <EscalationCard settings={settings} update={update} />
+
       <section class="card">
         <h2>Агент</h2>
         <div class="grid">
@@ -286,6 +342,22 @@ export function App() {
             step={1000}
             onChange={(v) => setAgent('maxObservationChars', v)}
           />
+        </div>
+        <div class="row" style={{ gap: '16px' }}>
+          <CheckField
+            label="Читать каждую страницу целиком"
+            hint="Перед выбором действия страница медленно листается до конца, как у человека: лёгкий текст 10–20 с на 1000 символов, код и селекторы 60–90 с, со случайными остановками. Нужен отладчик. Каждый адрес читается один раз за запуск"
+            checked={settings.agent.autoRead}
+            onChange={(v) => setAgent('autoRead', v)}
+          />
+          <NumberField
+            label="Автосброс контекста при заполнении, % (0 — выкл)"
+            value={settings.agent.contextResetPercent}
+            min={0}
+            max={99}
+            onChange={(v) => setAgent('contextResetPercent', v)}
+          />
+          <NumberField label="Макс. чтение одной страницы, мин" value={settings.agent.autoReadMaxMin} min={1} onChange={(v) => setAgent('autoReadMaxMin', v)} />
         </div>
         <div class="row" style={{ gap: '16px' }}>
           <CheckField
@@ -633,5 +705,86 @@ function ConnectionTester({ profile }: { profile: LlmProfile }) {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Автосмена моделей: базовая — активный профиль; когда она не справляется, шаги идут на следующей
+ * из цепочки, а потом возвращаются. Внешние (облачные) профили включаются отдельным разрешением.
+ */
+function EscalationCard({ settings, update }: { settings: Settings; update: (fn: (s: Settings) => Settings) => void }) {
+  const e = settings.escalation;
+  const set = <K extends keyof Settings['escalation']>(key: K, value: Settings['escalation'][K]) => update((s) => ({ ...s, escalation: { ...s.escalation, [key]: value } }));
+  const label = (id: ProfileId) => `${profileOf(settings, id).label} — ${profileOf(settings, id).model}`;
+  const free = settings.profileIds.filter((id) => id !== settings.activeProfile && !e.chain.includes(id));
+  const move = (i: number, d: -1 | 1) => {
+    const next = [...e.chain];
+    const j = i + d;
+    if (j < 0 || j >= next.length) return;
+    [next[i], next[j]] = [next[j]!, next[i]!];
+    set('chain', next);
+  };
+  const external = e.chain.filter((id) => isExternalProfile(profileOf(settings, id)));
+  return (
+    <section class="card">
+      <h2>Автосмена моделей</h2>
+      <p class="muted" style={{ margin: 0 }}>
+        Базовая модель — активный профиль. Если она не справляется (несколько неудачных шагов подряд, зацикливание, застревание, негодные ответы), шаги идут на следующей
+        модели из цепочки, а когда трудность позади — снова на базовой.
+      </p>
+      <CheckField label="Включить автосмену моделей" checked={e.enabled} onChange={(v) => set('enabled', v)} />
+      {e.enabled && (
+        <>
+          <div class="muted">Базовая: {label(settings.activeProfile)}</div>
+          {e.chain.map((id, i) => (
+            <div key={id} class="row" style={{ gap: '8px', alignItems: 'center' }}>
+              <span>{i + 1}.</span>
+              <span style={{ flex: 1 }}>
+                {label(id)}
+                {isExternalProfile(profileOf(settings, id)) ? ' ☁ внешняя' : ''}
+                {id === settings.activeProfile ? ' (это базовая — будет пропущена)' : ''}
+              </span>
+              <button type="button" disabled={i === 0} onClick={() => move(i, -1)} aria-label="Выше">
+                ↑
+              </button>
+              <button type="button" disabled={i === e.chain.length - 1} onClick={() => move(i, 1)} aria-label="Ниже">
+                ↓
+              </button>
+              <button type="button" onClick={() => set('chain', e.chain.filter((x) => x !== id))} aria-label="Убрать">
+                ✕
+              </button>
+            </div>
+          ))}
+          <select
+            aria-label="Добавить модель в цепочку"
+            value=""
+            disabled={free.length === 0}
+            onChange={(ev) => {
+              if (ev.currentTarget.value) set('chain', [...e.chain, ev.currentTarget.value]);
+              ev.currentTarget.value = '';
+            }}
+          >
+            <option value="">+ Добавить модель в цепочку…</option>
+            {free.map((id) => (
+              <option key={id} value={id}>
+                {label(id)}
+              </option>
+            ))}
+          </select>
+          <div class="grid">
+            <NumberField label="Неудачных шагов подряд до смены" value={e.failStreak} min={1} max={10} onChange={(v) => set('failStreak', v)} />
+            <NumberField label="Удачных шагов подряд до возврата на базовую" value={e.returnAfter} min={1} max={50} onChange={(v) => set('returnAfter', v)} />
+          </div>
+          <CheckField
+            label="Разрешить внешние (облачные) модели в цепочке"
+            hint="Тогда на сложных шагах текст страницы уходит за пределы вашей сети. Без этой галочки внешние профили в цепочке пропускаются. При переходе на внешнюю модель придёт уведомление."
+            checked={e.allowExternal}
+            onChange={(v) => set('allowExternal', v)}
+          />
+          {external.length > 0 && !e.allowExternal && <div class="warn">В цепочке есть внешние модели ({external.map((id) => profileOf(settings, id).label).join(', ')}) — они не будут использоваться, пока не включено разрешение.</div>}
+          {e.allowExternal && external.length > 0 && <div class="warn">Внешние модели в цепочке: текст страниц, на которых базовая модель застряла, уйдёт на их серверы.</div>}
+        </>
+      )}
+    </section>
   );
 }

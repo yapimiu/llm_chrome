@@ -1,6 +1,6 @@
 import { browser, defineContentScript } from '#imports';
 import type { ActionResult } from '@/lib/agent/types';
-import { findClickPoint, performAndSettle, readFieldValue, selectFieldContent, type DomAction } from '@/lib/dom/act';
+import { findClickPoint, performAndSettle, readFieldValue, readSource, scrollInfo, selectFieldContent, type DomAction } from '@/lib/dom/act';
 import { accessibleName, collectSnapshot, framesOf, topRect, type RegistryEntry, type TraceVerdict } from '@/lib/dom/collect';
 import { CursorOverlay } from '@/lib/dom/cursor';
 import { describeElement, diagnose, type Diagnosis } from '@/lib/dom/diagnose';
@@ -9,7 +9,7 @@ import { browserGeometry } from '@/lib/dom/geometry';
 import { DebugOverlay } from '@/lib/dom/overlay';
 import { ElementPicker } from '@/lib/dom/picker';
 import { serializePage } from '@/lib/dom/serialize';
-import { waitForStable } from '@/lib/dom/stable';
+import { waitForAnimations, waitForStable } from '@/lib/dom/stable';
 import type { FrameChildTag, RawFrameObservation } from '@/lib/frames';
 import { errorMessage, isContentRequest, type ContentRequest, type FrameGeometry, type FrameInfo, type HidePick, type Result } from '@/lib/messages';
 
@@ -47,6 +47,11 @@ export default defineContentScript({
     const overlay = new DebugOverlay(document);
     const hoverBox = new DebugOverlay(document);
     const cursor = new CursorOverlay(document);
+    // Визуальный курсор повторяет настоящую мышь, пока агент ею управляет (его включает background перед действием).
+    let followUntil = 0;
+    const following = (e: MouseEvent) => e.isTrusted && Date.now() < followUntil;
+    document.addEventListener('mousemove', (e) => following(e) && cursor.follow(e.clientX, e.clientY), { capture: true, passive: true });
+    document.addEventListener('mousedown', (e) => following(e) && (cursor.follow(e.clientX, e.clientY), cursor.click()), { capture: true, passive: true });
     const isOwn = (el: Element) => overlay.isOwn(el) || hoverBox.isOwn(el) || cursor.isOwn(el);
     const picker = new ElementPicker(document, {
       ignore: isOwn,
@@ -100,10 +105,14 @@ export default defineContentScript({
     const highlight = (enabled: boolean) => {
       if (!enabled) return overlay.hide();
       const visible = new Set(shown);
-      overlay.show(registry.filter((e) => visible.has(e.index)).map((e) => ({ index: e.index, rect: () => topRect(e, geom) })));
+      // Элемент мог исчезнуть после снимка (свернулся, затух) — тогда рамку не рисуем, а не оставляем висеть над текстом.
+    const shownNow = (e: RegistryEntry) => e.target.isConnected && geom.isVisible(e.target) && geom.paint?.(e.target).painted !== false;
+    overlay.show(registry.filter((e) => visible.has(e.index)).map((e) => ({ index: e.index, rect: () => (shownNow(e) ? topRect(e, geom) : null) })));
     };
 
-    const observe = (maxChars: number, hide: string[], next: string[], indexBase: number, frame?: FrameGeometry): RawFrameObservation => {
+    const observe = async (maxChars: number, hide: string[], next: string[], indexBase: number, frame?: FrameGeometry): Promise<RawFrameObservation> => {
+      // Посреди анимации (сворачивание нажатой реплики, раскрытие блока) снимок врёт о видимости.
+      await waitForAnimations(document);
       const snapshotId = nextSnapshotId++;
       // Фрейм того же origin уже обошёл родитель через contentDocument.
       if (sameOriginWithParent()) {
@@ -219,7 +228,7 @@ export default defineContentScript({
           return { ok: true, value: frame?.isConnected ? geom.frameContentBox(frame) : null };
         }
         case 'content:observe':
-          return { ok: true, value: observe(msg.maxChars, msg.hide, msg.next ?? [], msg.indexBase, msg.frame) };
+          return { ok: true, value: await observe(msg.maxChars, msg.hide, msg.next ?? [], msg.indexBase, msg.frame) };
         case 'content:show': {
           const snap = snapshots.get(msg.snapshotId);
           if (snap) registry = snap.registry;
@@ -232,6 +241,16 @@ export default defineContentScript({
           return { ok: true, value: null };
         case 'content:target-point':
           return { ok: true, value: findClickPoint(entryOf(msg.snapshotId, msg.index), geom, !msg.noScroll) };
+        case 'content:scroll-info': {
+          const snap = snapshots.get(msg.snapshotId);
+          if (!snap) throw new Error('the page state is outdated (page reloaded); look at the new page state');
+          return { ok: true, value: scrollInfo(msg.index, { registry: snap.registry, scroller: snap.scroller, win: window }, geom) };
+        }
+        case 'content:read-plan': {
+          const snap = snapshots.get(msg.snapshotId);
+          if (!snap) throw new Error('the page state is outdated (page reloaded); look at the new page state');
+          return { ok: true, value: readSource(msg.from, msg.to, { registry: snap.registry, scroller: snap.scroller, win: window }, geom) };
+        }
         case 'content:focus-select':
           selectFieldContent(entryOf(msg.snapshotId, msg.index).element);
           return { ok: true, value: null };
@@ -242,6 +261,9 @@ export default defineContentScript({
           return { ok: true, value: null };
         case 'content:watch-end':
           return { ok: true, value: await watchEnd() };
+        case 'content:cursor-follow':
+          followUntil = Date.now() + msg.ms;
+          return { ok: true, value: null };
         case 'content:cursor':
           await cursor.moveTo(msg.x, msg.y, msg.durationMs);
           if (msg.click) cursor.click();

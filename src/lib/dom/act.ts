@@ -3,6 +3,8 @@ import type { ActionResult } from '../agent/types';
 import { codeEditorLines, codeEditorSpec, hitsTarget, intersect, type RegistryEntry } from './collect';
 import { describeElement } from './diagnose';
 import type { Geometry } from './geometry';
+import { clipShape } from './paint';
+import { collectReadSegments, type ReadSegment } from './reading';
 import { DEFAULT_STABLE, waitForStable, type StableOptions } from './stable';
 
 /** Действия, которые выполняются внутри страницы (остальные — через API вкладок). */
@@ -195,6 +197,116 @@ function scrollPage(direction: 'up' | 'down', amount: number, ctx: ActContext): 
   return ok(`scrolled ${direction} by ${Math.round(Math.abs(after - before))}px`);
 }
 
+/** wheel: точка безопасна для колеса — под ней прокручивается именно нужная область. */
+export type ScrollInfo = { ok: true; x: number; y: number; wheel: boolean; page: number; top: number } | { ok: false; message: string };
+
+/** Под этими элементами колесо делает своё: листает фрейм, зумит карту, крутит видео. */
+const WHEEL_EATERS = 'canvas, iframe, frame, embed, object, video, .leaflet-container, .mapboxgl-map, .maplibregl-map, .gm-style, [class*="ymaps"]';
+const WHEEL_POINTS: readonly [number, number][] = [[0.5, 0.5], [0.5, 0.3], [0.5, 0.7], [0.3, 0.5], [0.7, 0.5], [0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]];
+
+/**
+ * Куда навести мышь для прокрутки колесом (координаты вьюпорта этого фрейма), высота «экрана»
+ * прокручиваемой области и текущая позиция прокрутки (сумма области и окна — по её изменению
+ * видно, подействовало ли колесо, даже если прокрутка передалась с блока на страницу).
+ */
+export function scrollInfo(index: number | undefined, ctx: ActContext, geom: Geometry): ScrollInfo {
+  const { win, scroller } = ctx;
+  let box: Element | null = scroller;
+  let anchor: Element | null = scroller;
+  if (index !== undefined) {
+    const entry = lookup(index, ctx);
+    if (typeof entry === 'string') return { ok: false, message: entry };
+    box = scrollableAncestor(entry.element);
+    anchor = box ?? entry.target;
+  }
+  const vp = geom.viewport();
+  const screen = { x: 0, y: 0, width: vp.width, height: vp.height };
+  const area = (anchor ? intersect(geom.rect(anchor), screen) : null) ?? screen;
+  // Колесо прокручивает то, что под мышью: ищем точку, где под ней нет вложенного скролла, фрейма или карты.
+  let point: { x: number; y: number } | null = null;
+  for (const [fx, fy] of WHEEL_POINTS) {
+    const x = Math.round(area.x + area.width * fx);
+    const y = Math.round(area.y + area.height * fy);
+    const hit = geom.hitTest(win.document, x, y);
+    if (!hit || hit.closest(WHEEL_EATERS) || scrollableAncestor(hit) !== box) continue;
+    point = { x, y };
+    break;
+  }
+  return {
+    ok: true,
+    x: point?.x ?? Math.round(area.x + area.width / 2),
+    y: point?.y ?? Math.round(area.y + area.height / 2),
+    wheel: point !== null,
+    page: box ? box.clientHeight : win.innerHeight,
+    top: (box?.scrollTop ?? 0) + win.scrollY,
+  };
+}
+
+export type ReadSource =
+  | { ok: true; x: number; y: number; wheel: boolean; from: number; to: number; top: number; target: number; viewport: number; segments: ReadSegment[] }
+  | { ok: false; message: string };
+
+/** Доля высоты экрана, на которой лежит «строка чтения»: текст у этой линии считается читаемым сейчас. */
+const READ_LINE = 0.5;
+
+/**
+ * Что нужно для чтения от элемента from до элемента to (номера в этом фрейме; без from — с текущего
+ * места, без to — до конца): абзацы между ними, откуда и докуда прокручивать, куда навести мышь.
+ */
+export function readSource(from: number | undefined, to: number | undefined, ctx: ActContext, geom: Geometry): ReadSource {
+  const { win, scroller } = ctx;
+  const doc = win.document;
+  const vp = geom.viewport();
+  const top = scroller ? scroller.scrollTop : win.scrollY;
+  const viewport = scroller ? scroller.clientHeight : vp.height;
+  const maxTop = scroller ? scroller.scrollHeight - scroller.clientHeight : Math.max(0, vp.scrollHeight - vp.height);
+  // contentY = viewportY − origin: начало координат содержимого прокручиваемой области.
+  const origin = scroller ? geom.rect(scroller).y - scroller.scrollTop : -win.scrollY;
+  const yOf = (index: number, edge: 'top' | 'bottom'): number | string => {
+    const entry = lookup(index, ctx);
+    if (typeof entry === 'string') return entry;
+    const r = geom.rect(entry.target);
+    return (edge === 'top' ? r.y : r.y + r.height) - origin;
+  };
+
+  let start = top + viewport * READ_LINE;
+  if (from !== undefined) {
+    const y = yOf(from, 'bottom');
+    if (typeof y === 'string') return { ok: false, message: y };
+    start = y;
+  }
+  let end = maxTop + viewport * READ_LINE + viewport * (1 - READ_LINE);
+  if (to !== undefined) {
+    const y = yOf(to, 'top');
+    if (typeof y === 'string') return { ok: false, message: y };
+    end = y;
+  }
+  if (end - start < 8) {
+    return { ok: false, message: to !== undefined && from !== undefined && end < start ? `element [${to}] is above element [${from}] — to read upwards use scroll` : 'there is no text between these places' };
+  }
+
+  const info = scrollInfo(undefined, ctx, geom);
+  if (!info.ok) return info;
+  const segments = collectReadSegments(doc, {
+    origin,
+    from: start,
+    to: end,
+    isVisible: (el) => geom.isVisible(el),
+    rectOf: (node) => {
+      const range = doc.createRange();
+      range.selectNodeContents(node);
+      const r = range.getBoundingClientRect();
+      return r.height > 0 ? { top: r.top, bottom: r.bottom } : null;
+    },
+  });
+  // Прокручиваем так, чтобы строка чтения шла от start до end; дальше конца страницы листать некуда.
+  const target = Math.min(maxTop, Math.max(0, end - viewport * READ_LINE));
+  return { ok: true, x: info.x, y: info.y, wheel: info.wheel, from: start, to: end, top, target, viewport, segments };
+}
+
+/** Позиция прокрутки, с которой строка чтения стоит на y. */
+export const readTopFor = (y: number, viewport: number): number => Math.max(0, y - viewport * READ_LINE);
+
 /** Наведение синтетическими событиями: открывает выпадающие меню и подсказки (фолбэк без CDP). */
 export function dispatchHover(target: Element): void {
   target.scrollIntoView?.({ block: 'center', inline: 'center', behavior: 'instant' });
@@ -327,17 +439,33 @@ export function findClickPoint(entry: RegistryEntry, geom: Geometry, scroll = tr
   if (!entry.target.isConnected) return { ok: false, message: `element [${entry.index}] is gone — the page changed, look at the new page state` };
   if (isDisabled(entry.element)) return { ok: false, message: `element [${entry.index}] is disabled` };
   if (scroll) entry.target.scrollIntoView?.({ block: 'center', inline: 'center', behavior: 'instant' });
+  // Элемент остался в DOM, но не нарисован (свёрнут, обрезан, затух) — нажимать нечего.
+  const paint = geom.paint?.(entry.target);
+  if (paint && !paint.painted) return { ok: false, message: `element [${entry.index}] is no longer visible on the page (${paint.why}) — look at the current page state` };
   const vp = geom.viewport();
-  const visible = intersect(geom.rect(entry.target), { x: 0, y: 0, width: vp.width, height: vp.height });
-  if (!visible) return { ok: false, message: `element [${entry.index}] is outside the visible area${scroll ? ' even after scrolling' : ''}` };
+  const screen = { x: 0, y: 0, width: vp.width, height: vp.height };
+  // Строчный элемент на несколько строк: целимся в его строки, а не в центр охватывающего прямоугольника.
+  const frags = geom.fragments?.(entry.target) ?? [];
+  const shapes = frags.length > 1 ? frags : [geom.rect(entry.target)];
   const root = entry.target.getRootNode() as Document | ShadowRoot;
-  const at = (fx: number, fy: number) => ({ x: visible.x + visible.width * fx, y: visible.y + visible.height * fy });
   let blocker: Element | null = null;
-  for (const p of [at(0.5, 0.5), at(0.25, 0.5), at(0.75, 0.5), at(0.5, 0.25), at(0.5, 0.75)]) {
-    const hit = geom.hitTest(root, p.x, p.y);
-    if (hitsTarget(hit, entry.element, entry.target)) return { ok: true, x: Math.round(p.x), y: Math.round(p.y) };
-    blocker ??= hit;
+  let onScreen = false;
+  let painted = false;
+  for (const shape of shapes) {
+    const part = paint ? clipShape(shape, paint.clip) : shape;
+    if (part) painted = true;
+    const visible = part ? intersect(part, screen) : null;
+    if (!visible) continue;
+    onScreen = true;
+    const at = (fx: number, fy: number) => ({ x: visible.x + visible.width * fx, y: visible.y + visible.height * fy });
+    for (const p of [at(0.5, 0.5), at(0.25, 0.5), at(0.75, 0.5), at(0.5, 0.25), at(0.5, 0.75)]) {
+      const hit = geom.hitTest(root, p.x, p.y);
+      if (hitsTarget(hit, entry.element, entry.target)) return { ok: true, x: Math.round(p.x), y: Math.round(p.y) };
+      blocker ??= hit;
+    }
   }
+  if (!painted) return { ok: false, message: `element [${entry.index}] is no longer visible on the page (clipped by a collapsed or hidden container) — look at the current page state` };
+  if (!onScreen) return { ok: false, message: `element [${entry.index}] is outside the visible area${scroll ? ' even after scrolling' : ''}` };
   return { ok: false, message: `element [${entry.index}] is covered by ${blocker ? describeElement(blocker) : 'another element'}` };
 }
 

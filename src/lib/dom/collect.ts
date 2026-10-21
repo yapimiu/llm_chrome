@@ -1,3 +1,4 @@
+import { clipShape } from './paint';
 import type { ElementStyle, Geometry } from './geometry';
 import { hasRules, isHiddenByRules, parseHideRules } from './hide-rules';
 import { collapseWhitespace, safeDecodeUri } from './serialize';
@@ -39,14 +40,15 @@ export interface CollectOptions {
 /** Почему сборщик включил или отбросил элемент. */
 export type TraceVerdict =
   | { kind: 'accepted'; index: number }
-  | { kind: 'hidden' }
+  /** why — чем именно скрыт (обрезан предком, прозрачен, внутри aria-hidden); без него — CSS/размер. */
+  | { kind: 'hidden'; why?: string }
   | { kind: 'offscreen' }
   | { kind: 'covered'; by: Element | null }
   | { kind: 'too-big' }
   /** Безымянная обёртка (tooltip-wrapper и т.п.) вокруг другого элемента — показан вложенный. */
   | { kind: 'wrapper' }
   | { kind: 'not-interactive'; cursor: string; parentCursor: string; clickableAncestor: ClickableAncestor }
-  | { kind: 'skipped'; reason: 'tag' | 'ignored' | 'inert' | 'display-none' | 'user-hidden' };
+  | { kind: 'skipped'; reason: 'tag' | 'ignored' | 'inert' | 'display-none' | 'user-hidden' | 'locked' };
 
 /**
  * Есть ли кликабельный предок и какой. Внутри семантического (a, button, role=button)
@@ -465,6 +467,15 @@ function translate(r: Rect, o: { x: number; y: number }): Rect {
   return { x: r.x + o.x, y: r.y + o.y, width: r.width, height: r.height };
 }
 
+const CHOICE_ROLES = new Set(['radio', 'checkbox', 'switch', 'option', 'menuitemradio', 'menuitemcheckbox']);
+
+/** Вариант ответа (radio/checkbox и их роли), который нельзя изменить: disabled или aria-disabled. */
+function isLockedChoice(el: Element, info: { states: string[]; type?: string; role?: string }): boolean {
+  if (!info.states.includes('disabled')) return false;
+  const type = el.localName === 'input' ? (el as HTMLInputElement).type : '';
+  return type === 'radio' || type === 'checkbox' || CHOICE_ROLES.has(info.role ?? '');
+}
+
 /** Видимая часть элемента или зона за пределами экрана; null — недостижим (карусель, скрытый скролл iframe). */
 function classify(r: Rect, clip: Rect, view: Rect): { zone: Zone; distance: number; visiblePart?: Rect } | null {
   const area = intersect(clip, view);
@@ -486,7 +497,7 @@ export function hitsTarget(hit: Element | null, el: Element, target: Element): b
 type TextSeg = string | Element;
 
 /** Подставляет номера элементов в текст: ссылки на неотобранные элементы пропадают. */
-function renderText(lines: readonly TextSeg[][], registry: readonly RegistryEntry[]): string {
+function renderText(lines: readonly TextSeg[][], registry: readonly RegistryEntry[], notes: ReadonlyMap<Element, string> = new Map()): string {
   const indexOf = new Map<Element, number>();
   for (const r of registry) {
     indexOf.set(r.element, r.index);
@@ -505,6 +516,8 @@ function renderText(lines: readonly TextSeg[][], registry: readonly RegistryEntr
         if (i !== undefined && !seen.has(i)) {
           seen.add(i);
           s += ` [${i}] `;
+        } else if (i === undefined && notes.has(seg) && !s.endsWith(notes.get(seg)!)) {
+          s += notes.get(seg)!;
         }
       }
       // Пробелы от границ inline-block и номеров не нужны перед знаками препинания.
@@ -550,6 +563,13 @@ export function topRect(entry: RegistryEntry, geom: Geometry): Rect {
   for (const frame of entry.frames) {
     const box = geom.frameContentBox(frame);
     offset = { x: offset.x + box.x, y: offset.y + box.y };
+  }
+  // Строчный элемент на несколько строк: рамка — строка, которая видна, а не охват всего абзаца.
+  const frags = geom.fragments?.(entry.target) ?? [];
+  if (frags.length > 1) {
+    const vp = geom.viewport();
+    const screen = { x: 0, y: 0, width: vp.width, height: vp.height };
+    return translate(frags.find((f) => intersect(f, screen)) ?? frags[0]!, offset);
   }
   return translate(geom.rect(entry.target), offset);
 }
@@ -598,6 +618,8 @@ export function collectSnapshot(doc: Document, geom: Geometry, opts: CollectOpti
   /** Возвращает false, если элемент отброшен как гигантская эвристическая обёртка. */
   /** Переключатели, уже показанные модели через свою label (и наоборот) — чтобы не было дублей. */
   const representedControls = new Set<Element>();
+  /** Заблокированные варианты ответа: в списке их нет, в тексте — пометка (см. isLockedChoice). */
+  const lockedNotes = new Map<Element, string>();
   const representedLabels = new Set<Element>();
 
   /** Спрятанный checkbox/radio/file, который рисует эта label; null — label обычная. */
@@ -636,23 +658,39 @@ export function collectSnapshot(doc: Document, geom: Geometry, opts: CollectOpti
         failure ??= { kind: 'hidden' };
         continue;
       }
-      const rect = translate(local, ctx.offset);
-      const place = classify(rect, ctx.clip, view);
-      if (!place) {
-        failure ??= { kind: 'offscreen' };
+      // Нарисован ли на самом деле: свёрнутый блок, слайд за краем карусели, затухшая кнопка остаются в DOM.
+      const paint = geom.paint?.(t);
+      if (paint && !paint.painted) {
+        failure ??= { kind: 'hidden', why: paint.why };
         continue;
       }
-      if (place.visiblePart) {
-        const cx = place.visiblePart.x + place.visiblePart.width / 2 - ctx.offset.x;
-        const cy = place.visiblePart.y + place.visiblePart.height / 2 - ctx.offset.y;
-        const hit = geom.hitTest(t.getRootNode() as Document | ShadowRoot, cx, cy);
-        if (!hitsTarget(hit, el, t)) {
-          failure ??= { kind: 'covered', by: hit };
+      // Строчный элемент на несколько строк — несколько прямоугольников; общий охватывает чужой текст.
+      const frags = geom.fragments?.(t) ?? [];
+      const shapes = (frags.length > 1 ? frags : [local]).map((s) => (paint ? clipShape(s, paint.clip) : s)).filter((s): s is Rect => s !== null);
+      if (shapes.length === 0) {
+        failure ??= { kind: 'hidden', why: 'clipped by a collapsed or hidden container' };
+        continue;
+      }
+      for (const shape of shapes) {
+        const rect = translate(shape, ctx.offset);
+        const place = classify(rect, ctx.clip, view);
+        if (!place) {
+          failure ??= { kind: 'offscreen' };
           continue;
         }
+        if (place.visiblePart) {
+          const cx = place.visiblePart.x + place.visiblePart.width / 2 - ctx.offset.x;
+          const cy = place.visiblePart.y + place.visiblePart.height / 2 - ctx.offset.y;
+          const hit = geom.hitTest(t.getRootNode() as Document | ShadowRoot, cx, cy);
+          if (!hitsTarget(hit, el, t)) {
+            failure ??= { kind: 'covered', by: hit };
+            continue;
+          }
+        }
+        chosen = { target: t, rect, place };
+        break;
       }
-      chosen = { target: t, rect, place };
-      break;
+      if (chosen) break;
     }
     if (!chosen) {
       const f = failure ?? { kind: 'hidden' as const };
@@ -666,6 +704,16 @@ export function collectSnapshot(doc: Document, geom: Geometry, opts: CollectOpti
     // label спрятанного переключателя показываем как сам переключатель (с его checked), кликаем label.
     const subject = detected.control ?? el;
     const described = detected.editor ? describeEditor(el) : describe(subject, geom);
+    // Заблокированный вариант ответа (тест уже пройден): нажать нельзя, модель жала бы его снова и снова.
+    // В список не попадает, а в тексте страницы остаётся пометка, какой вариант выбран.
+    if (isLockedChoice(subject, described)) {
+      const note = described.states.includes('checked') ? ' (✓ chosen, locked) ' : '';
+      for (const n of [el, subject, target]) lockedNotes.set(n, note);
+      trace?.set(el, { kind: 'skipped', reason: 'locked' });
+      if (detected.control) representedControls.add(detected.control);
+      if (target !== el) representedControls.add(el);
+      return true;
+    }
     const index = elements.length + 1;
     const info: ElementInfo = { ...described, index, zone: place.zone, distance: Math.round(place.distance), rect };
     if (hasRules(nextRules) && (isHiddenByRules(el, described.name, nextRules) || (subject !== el && isHiddenByRules(subject, described.name, nextRules)))) {
@@ -961,7 +1009,7 @@ export function collectSnapshot(doc: Document, geom: Geometry, opts: CollectOpti
             viewportHeight: vp.height,
           },
       elements,
-      text: renderText(textLines, registry).slice(0, maxTextChars),
+      text: renderText(textLines, registry, lockedNotes).slice(0, maxTextChars),
       stats,
     },
     registry,

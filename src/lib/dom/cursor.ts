@@ -68,6 +68,17 @@ export class CursorOverlay {
     return new Promise((resolve) => setTimeout(resolve, durationMs));
   }
 
+  /**
+   * Курсор следует за настоящей мышью: вызывается на каждое событие mousemove (≈125 Гц от CDP),
+   * поэтому показывает ровно ту траекторию, по которой ходит мышь, — и при hover, и при перетаскивании.
+   */
+  follow(x: number, y: number): void {
+    this.pos = { x, y };
+    if (!this.host) this.mount();
+    else this.place(this.pos, 40);
+    this.hideLater();
+  }
+
   /** Кружок «нажатия» под курсором. */
   click(): void {
     if (!this.ripple) return;

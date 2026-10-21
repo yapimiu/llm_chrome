@@ -1,5 +1,9 @@
 export type ScrollDirection = 'up' | 'down';
 
+/** Темп чтения: auto — по тексту (код и селекторы медленнее), light — шутки и вступления, careful — всё внимательно. */
+export const READ_PACES = ['auto', 'light', 'careful'] as const;
+export type ReadPace = (typeof READ_PACES)[number];
+
 /**
  * Клавиши для press_key. Только навигация: Enter и пробел на кнопке — это клик или отправка формы,
  * их риск проверяется через click и type с submit, а не через «просто клавишу».
@@ -14,6 +18,8 @@ export type AgentAction =
   /** index — прокрутить область, в которой лежит этот элемент (список, чат, боковая панель), а не страницу. */
   | { action: 'scroll'; direction: ScrollDirection; amount: number; index?: number }
   | { action: 'hover'; index: number }
+  /** Медленно прочитать текст от элемента index (по умолчанию — от текущего места) до to_index (по умолчанию — до конца страницы). */
+  | { action: 'read'; index?: number; to_index?: number; pace?: ReadPace }
   | { action: 'press_key'; key: KeyName }
   | { action: 'drag'; index: number; to_index: number }
   | { action: 'wait_for'; text: string; timeout_ms: number }
@@ -42,6 +48,7 @@ export const ACTION_NAMES: readonly ActionName[] = [
   'type',
   'select',
   'scroll',
+  'read',
   'hover',
   'press_key',
   'drag',
@@ -100,6 +107,7 @@ export function agentResponseSchema(maxActions: number): JsonSchema {
             actionSchema('type', { index: int(1), text: str(), submit: { type: 'boolean' } }, ['submit']),
             actionSchema('select', { index: int(1), value: str() }),
             actionSchema('scroll', { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number' }, index: int(1) }, ['amount', 'index']),
+            actionSchema('read', { index: int(1), to_index: int(1), pace: { type: 'string', enum: [...READ_PACES] } }, ['index', 'to_index', 'pace']),
             actionSchema('hover', { index: int(1) }),
             actionSchema('press_key', { key: { type: 'string', enum: [...KEY_NAMES] } }),
             actionSchema('drag', { index: int(1), to_index: int(1) }),
@@ -138,6 +146,8 @@ export function formatAction(a: AgentAction): string {
       return `select [${a.index}] ${q(a.value)}`;
     case 'scroll':
       return `scroll ${a.direction} ${a.amount}${a.index !== undefined ? ` in [${a.index}]` : ''}`;
+    case 'read':
+      return `read${a.index !== undefined ? ` [${a.index}]` : ''}${a.to_index !== undefined ? ` → [${a.to_index}]` : ' → end'}${a.pace && a.pace !== 'auto' ? ` (${a.pace})` : ''}`;
     case 'hover':
       return `hover [${a.index}]`;
     case 'press_key':

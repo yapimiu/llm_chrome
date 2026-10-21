@@ -1,10 +1,12 @@
 import { storage } from '#imports';
 import { DEFAULT_RISK_RULES, type RiskRules, type SiteRiskMode } from './agent/risk';
 import type { SiteNote } from './agent/site-notes';
-import { PROVIDERS, type ProviderId } from './llm/providers';
+import { PROVIDERS, providerInfo, type ProviderId } from './llm/providers';
+import { isLocalHost, normalizeBaseUrl } from './llm/url';
 import type { ScreenshotMode } from './agent/runner';
 
-export type ProfileId = 'fast' | 'slow' | 'cloud';
+/** Идентификатор профиля: 'fast', 'slow', 'cloud' из коробки и любые свои (создаются в настройках). */
+export type ProfileId = string;
 
 /** Как просить у сервера структурированный ответ. */
 export type StructuredOutputMode = 'auto' | 'json_schema' | 'json_object' | 'off';
@@ -49,6 +51,12 @@ export interface AgentSettings {
   loopThreshold: number;
   /** Столько шагов подряд без пользы на одном месте — и агент сам прокручивает вниз (0 — выкл). */
   autoScrollAfter: number;
+  /** Сбрасывать контекст, когда промпт и ответ занимают столько % бюджета профиля (0 — не сбрасывать). */
+  contextResetPercent: number;
+  /** Читать каждую новую страницу целиком, как человек (медленная прокрутка до конца) — до того, как модель выберет действие. */
+  autoRead: boolean;
+  /** Потолок времени на чтение одной страницы, минуты. */
+  autoReadMaxMin: number;
   /** Жёсткий лимит символов на наблюдение (сериализованную страницу). */
   maxObservationChars: number;
   /** Пошаговый режим: перед выполнением действий агент ждёт «Выполнить» от человека. */
@@ -95,9 +103,28 @@ export interface LoggingSettings {
   remoteUrl: string;
 }
 
+/**
+ * Автосмена моделей: базовая — активный профиль; если она не справляется, шаги идут на следующей
+ * из chain (по порядку), а когда трудность позади — снова на базовой.
+ */
+export interface EscalationSettings {
+  enabled: boolean;
+  /** Профили, на которые переходить по порядку, когда текущий не справляется. */
+  chain: ProfileId[];
+  /** Пускать в цепочку внешние (облачные) профили — текст страниц уйдёт за пределы сети. */
+  allowExternal: boolean;
+  /** Сколько неудачных шагов подряд — повод перейти на следующую модель. */
+  failStreak: number;
+  /** Сколько удачных шагов подряд на сильной модели — повод вернуться на базовую. */
+  returnAfter: number;
+}
+
 export interface Settings {
   activeProfile: ProfileId;
+  /** Порядок профилей (вкладки, списки). Профиль, которого нет в списке, не существует. */
+  profileIds: ProfileId[];
   profiles: Record<ProfileId, LlmProfile>;
+  escalation: EscalationSettings;
   agent: AgentSettings;
   safety: SafetySettings;
   logging: LoggingSettings;
@@ -106,8 +133,10 @@ export interface Settings {
   siteNotes: SiteNote[];
 }
 
-export const DEFAULT_SETTINGS: Settings = {
+export const DEFAULT_SETTINGS: Settings & { profiles: Record<'fast' | 'slow' | 'cloud', LlmProfile> } = {
   activeProfile: 'fast',
+  profileIds: ['fast', 'slow', 'cloud'],
+  escalation: { enabled: false, chain: ['slow', 'cloud'], allowExternal: false, failStreak: 2, returnAfter: 3 },
   profiles: {
     fast: {
       label: 'Быстрый',
@@ -161,6 +190,9 @@ export const DEFAULT_SETTINGS: Settings = {
     stepTimeoutSec: 60,
     loopThreshold: 3,
     autoScrollAfter: 2,
+    contextResetPercent: 85,
+    autoRead: false,
+    autoReadMaxMin: 10,
     skipWithAgent: true,
     typeByKeys: false,
     typeDelayMs: 30,
@@ -198,7 +230,9 @@ const RISK_MODES: readonly SiteRiskMode[] = ['ask', 'allow', 'block'];
 
 const SCREENSHOT_MODES: readonly ScreenshotMode[] = ['off', 'stuck', 'always'];
 const STRUCTURED_MODES: readonly StructuredOutputMode[] = ['auto', 'json_schema', 'json_object', 'off'];
-const PROFILE_IDS: readonly ProfileId[] = ['fast', 'slow', 'cloud'];
+const DEFAULT_PROFILE_IDS: readonly ProfileId[] = ['fast', 'slow', 'cloud'];
+const MAX_PROFILES = 30;
+const MAX_PROFILE_ID = 40;
 
 type Unknown<T> = { [K in keyof T]?: unknown };
 
@@ -219,6 +253,12 @@ function num(v: unknown, fallback: number, min: number, max: number, integer = f
   if (typeof n !== 'number' || !Number.isFinite(n)) return fallback;
   const clamped = Math.min(max, Math.max(min, n));
   return integer ? Math.round(clamped) : clamped;
+}
+
+/** 0 — выключено; иначе 30–99 %: ниже половины бюджета сброс срабатывал бы постоянно. */
+function resetPercent(v: unknown, fallback: number): number {
+  const n = num(v, fallback, 0, 99, true);
+  return n === 0 ? 0 : Math.max(30, n);
 }
 
 function sanitizeProfile(raw: unknown, def: LlmProfile): LlmProfile {
@@ -243,6 +283,36 @@ function sanitizeProfile(raw: unknown, def: LlmProfile): LlmProfile {
   };
 }
 
+/**
+ * Список профилей: сохранённый порядок (если есть), иначе — стандартные плюс те, что нашлись в profiles.
+ * Удалённый профиль не возвращается: список — единственный источник правды.
+ */
+function sanitizeProfileIds(raw: unknown, rawProfiles: Record<string, unknown>, defaults: Settings): ProfileId[] {
+  const valid = (id: unknown): id is string => typeof id === 'string' && id.length > 0 && id.length <= MAX_PROFILE_ID;
+  const wanted = Array.isArray(raw) ? raw.filter(valid) : [...DEFAULT_PROFILE_IDS, ...Object.keys(rawProfiles).filter(valid)];
+  const ids = [...new Set(wanted)].slice(0, MAX_PROFILES);
+  return ids.length > 0 ? ids : [...defaults.profileIds];
+}
+
+function sanitizeEscalation(raw: unknown, def: EscalationSettings, ids: readonly ProfileId[]): EscalationSettings {
+  const r: Unknown<EscalationSettings> = isRecord(raw) ? raw : {};
+  const chain = Array.isArray(r.chain) ? r.chain.filter((id): id is string => typeof id === 'string' && ids.includes(id)) : def.chain.filter((id) => ids.includes(id));
+  return {
+    enabled: bool(r.enabled, def.enabled),
+    chain: [...new Set(chain)],
+    allowExternal: bool(r.allowExternal, def.allowExternal),
+    failStreak: num(r.failStreak, def.failStreak, 1, 10, true),
+    returnAfter: num(r.returnAfter, def.returnAfter, 1, 50, true),
+  };
+}
+
+/** Данные страниц уходят за пределы своей сети: облачный провайдер или адрес не из домашней сети. */
+export function isExternalProfile(p: LlmProfile): boolean {
+  if (providerInfo(p.provider).cloud) return true;
+  const url = normalizeBaseUrl(p.baseUrl);
+  return url === null || !isLocalHost(url);
+}
+
 /** Разбирает extraBody; пустая строка — пустой объект. Бросает понятную ошибку. */
 export function parseExtraBody(raw: string): Record<string, unknown> {
   if (raw.trim() === '') return {};
@@ -264,6 +334,9 @@ function sanitizeAgent(raw: unknown, def: AgentSettings): AgentSettings {
     stepTimeoutSec: num(r.stepTimeoutSec, def.stepTimeoutSec, 5, 3600, true),
     loopThreshold: num(r.loopThreshold, def.loopThreshold, 2, 20, true),
     autoScrollAfter: num(r.autoScrollAfter, def.autoScrollAfter, 0, 20, true),
+    contextResetPercent: resetPercent(r.contextResetPercent, def.contextResetPercent),
+    autoRead: bool(r.autoRead, def.autoRead),
+    autoReadMaxMin: num(r.autoReadMaxMin, def.autoReadMaxMin, 1, 120, true),
     maxObservationChars: num(r.maxObservationChars, def.maxObservationChars, 1000, 500_000, true),
     approveEachStep: bool(r.approveEachStep, def.approveEachStep),
     autonomous: bool(r.autonomous, def.autonomous),
@@ -298,15 +371,14 @@ export function sanitizeSettings(raw: unknown, defaults: Settings = DEFAULT_SETT
   const rawProfiles = isRecord(r.profiles) ? r.profiles : {};
   const logging: Unknown<LoggingSettings> = isRecord(r.logging) ? r.logging : {};
   const notify: Unknown<NotifySettings> = isRecord(r.notify) ? r.notify : {};
+  const profileIds = sanitizeProfileIds(r.profileIds, rawProfiles, defaults);
+  const base = defaults.profiles.fast ?? Object.values(defaults.profiles)[0]!;
+  const active = profileIds.includes(r.activeProfile as ProfileId) ? (r.activeProfile as ProfileId) : profileIds.includes(defaults.activeProfile) ? defaults.activeProfile : profileIds[0]!;
   return {
-    activeProfile: PROFILE_IDS.includes(r.activeProfile as ProfileId)
-      ? (r.activeProfile as ProfileId)
-      : defaults.activeProfile,
-    profiles: {
-      fast: sanitizeProfile(rawProfiles.fast, defaults.profiles.fast),
-      slow: sanitizeProfile(rawProfiles.slow, defaults.profiles.slow),
-      cloud: sanitizeProfile(rawProfiles.cloud, defaults.profiles.cloud),
-    },
+    activeProfile: active,
+    profileIds,
+    profiles: Object.fromEntries(profileIds.map((id) => [id, sanitizeProfile(rawProfiles[id], defaults.profiles[id] ?? base)])),
+    escalation: sanitizeEscalation(r.escalation, defaults.escalation, profileIds),
     agent: sanitizeAgent(r.agent, defaults.agent),
     safety: sanitizeSafety(r.safety, defaults.safety),
     logging: {
@@ -335,8 +407,27 @@ export function sanitizeSettings(raw: unknown, defaults: Settings = DEFAULT_SETT
   };
 }
 
+/** Профиль по id; неизвестный id (профиль удалён) заменяется активным, чтобы запуск не падал. */
+export function profileOf(s: Settings, id: ProfileId): LlmProfile {
+  return s.profiles[id] ?? s.profiles[s.activeProfile] ?? Object.values(s.profiles)[0]!;
+}
+
 export function activeProfile(s: Settings): LlmProfile {
-  return s.profiles[s.activeProfile];
+  return profileOf(s, s.activeProfile);
+}
+
+/**
+ * Модели для запуска по порядку: активная — базовая, дальше цепочка эскалации. Внешние профили
+ * (облако) попадают в неё только с разрешением allowExternal. Без автосмены — только базовая.
+ */
+export function modelLevels(s: Settings): { id: ProfileId; profile: LlmProfile }[] {
+  const base = { id: s.activeProfile, profile: activeProfile(s) };
+  if (!s.escalation.enabled) return [base];
+  const rest = s.escalation.chain
+    .filter((id) => id !== s.activeProfile && s.profiles[id])
+    .map((id) => ({ id, profile: s.profiles[id]! }))
+    .filter((l) => s.escalation.allowExternal || !isExternalProfile(l.profile));
+  return [base, ...rest];
 }
 
 // storage.local, а не sync: API-ключ не должен уезжать в облако Google.

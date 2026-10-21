@@ -1,7 +1,9 @@
+import { advance, INITIAL_ESCALATION, isEscalationEnabled, judgeStep, type EscalationConfig, type ModelLevel } from './escalation';
 import type { ChatDelta, ChatMessage, ChatResult } from '../llm/client';
 import { describeError, isTransientError } from '../llm/client';
 import { formatAction, targetIndex, type AgentAction } from './actions';
-import { buildHistory } from './history';
+import { updateTokenRatio } from './context';
+import { buildDigest, buildHistory } from './history';
 import { actionSignature, fingerprint, LoopDetector, pageSignature } from './loop';
 import { elementLine, type TabInfo } from './prompt';
 import { assessAction, describeRisks, sitePolicyFor, type RiskRules } from './risk';
@@ -41,8 +43,16 @@ export interface RunConfig {
   approvalWindowSec: number;
   /** Столько шагов подряд без пользы на одном месте — и агент сам прокручивает вниз (0 — выкл). */
   autoScrollAfter: number;
+  /** Читать каждую новую страницу целиком (медленная прокрутка, как человек) до выбора действия. */
+  autoRead?: boolean;
   /** Скриншот с номерами элементов: никогда, когда агент застрял, или на каждом шаге (только для моделей со зрением). */
   screenshots?: ScreenshotMode;
+  /** Потолок одного чтения (read, авточтение), секунды: зависший браузер не должен остановить ночной запуск. */
+  readTimeoutSec?: number;
+  /** Сбрасывать контекст при заполнении бюджета на столько % (0/не задано — не сбрасывать). */
+  contextResetPercent?: number;
+  /** Автосмена моделей: ступени [базовая, …сильнее] и пороги; не задано — одна модель. */
+  escalation?: EscalationConfig;
 }
 
 export type ScreenshotMode = 'off' | 'stuck' | 'always';
@@ -67,16 +77,18 @@ export interface Observation {
 }
 
 export interface RunDeps {
-  observe(opts?: { screenshot: boolean }): Promise<Observation>;
+  observe(opts?: { screenshot: boolean; maxChars?: number }): Promise<Observation>;
   chat(
     messages: ChatMessage[],
     schema: Record<string, unknown>,
     onDelta: (d: ChatDelta) => void,
     onRetry: (info: { attempt: number; waitMs: number; error: string }) => void,
     signal: AbortSignal,
+    /** Профиль модели этой ступени (при автосмене); не задан — профиль запуска. */
+    profileId?: string,
   ): Promise<ChatResult>;
   /** Действия, меняющие страницу/вкладку (кроме done/ask_user/extract — их ведёт сам цикл). */
-  execute(action: AgentAction, handle: ObservationHandle): Promise<ActionResult>;
+  execute(action: AgentAction, handle: ObservationHandle, signal?: AbortSignal): Promise<ActionResult>;
   onState(state: RunState): void;
   onProgress(e: StepEvent): void;
   persistRun(state: RunState): Promise<void>;
@@ -110,7 +122,7 @@ export function serviceBackoffMs(n: number): number {
 type StepResult = 'ok' | 'model-error' | 'service-error';
 
 /** Безопасные действия, которые не требуют одобрения даже в пошаговом режиме. */
-const NO_APPROVAL: ReadonlySet<AgentAction['action']> = new Set(['done', 'ask_user', 'extract', 'wait', 'wait_for', 'scroll', 'hover']);
+const NO_APPROVAL: ReadonlySet<AgentAction['action']> = new Set(['done', 'ask_user', 'extract', 'wait', 'wait_for', 'scroll', 'hover', 'read']);
 
 /** Столько шагов подряд, упёршихся в отложенное или запрещённое, — и запуск завершается. */
 export const MAX_DEFER_STREAK = 3;
@@ -289,6 +301,7 @@ export class AgentRunner {
           break;
         }
         const result = await this.step();
+        this.escalate(result);
         const lastError = () => this.state.steps.at(-1)?.error ?? '';
         if (result === 'ok') {
           modelErrors = 0;
@@ -342,8 +355,74 @@ export class AgentRunner {
     s.status = 'running';
   }
 
+  /** Текущая ступень цепочки моделей; без автосмены — undefined (работает модель запуска). */
+  private currentLevel(): ModelLevel | undefined {
+    const cfg = this.cfg.escalation;
+    if (!cfg || cfg.levels.length === 0) return undefined;
+    return cfg.levels[Math.min(this.state.escalation?.level ?? 0, cfg.levels.length - 1)];
+  }
+
+  /** Заметка о смене модели: попадает в следующий шаг (его запись сохраняется вместе с ней). */
+  private switchNote: string | null = null;
+
+  /** После каждого шага: удача или неудача двигают запуск по цепочке моделей (см. escalation.ts). */
+  private escalate(result: StepResult): void {
+    const cfg = this.cfg.escalation;
+    const record = this.state.steps.at(-1);
+    if (!isEscalationEnabled(cfg) || !record) return;
+    const { state, change } = advance(this.state.escalation ?? INITIAL_ESCALATION, cfg, judgeStep(record, result));
+    this.state.escalation = state;
+    if (!change) return;
+    const to = cfg.levels[change.to]!;
+    const from = cfg.levels[change.from]!;
+    this.state.profileLabel = to.label;
+    this.state.model = to.model;
+    this.loop.reset();
+    const direction = change.to > change.from ? 'harder' : 'back';
+    this.switchNote = `MODEL SWITCH: ${from.label} → ${to.label} (${change.reason}). ${direction === 'harder' ? 'A previous model was struggling here — look at the page and the history with fresh eyes.' : 'Continue the task.'}`;
+    if (to.external && !from.external) this.deps.alert(`Переход на внешнюю модель «${to.label}»: текст страниц уходит за пределы вашей сети (${change.reason}).`);
+    this.emit();
+  }
+
+  /**
+   * Чтение с потолком времени. Таймаут сам по себе прокрутку не остановит, поэтому у чтения свой
+   * сигнал отмены: его взводят «Стоп», истёкший потолок и конец чтения.
+   */
+  private async readBounded(action: AgentAction, handle: ObservationHandle): Promise<ActionResult> {
+    const ctl = new AbortController();
+    const onStop = () => ctl.abort();
+    this.abort.signal.addEventListener('abort', onStop);
+    try {
+      return await withTimeout(this.deps.execute(action, handle, ctl.signal), (this.cfg.readTimeoutSec ?? 3600) * 1000, 'read');
+    } finally {
+      ctl.abort();
+      this.abort.signal.removeEventListener('abort', onStop);
+    }
+  }
+
+  /** Поправка оценки токенов по реальному расходу сервера (см. updateTokenRatio). */
+  private tokenRatio = 1;
+
+  /** Адреса, которые уже прочитаны в этом запуске (без #якоря): каждую страницу читаем один раз. */
+  private readonly readPages = new Set<string>();
+
+  /** Читает страницу целиком, если включено и этот адрес ещё не читали; true — страница прокручена. */
+  private async autoRead(obs: Observation, record: StepRecord): Promise<boolean> {
+    if (!this.cfg.autoRead) return false;
+    const key = obs.url.split('#')[0] ?? obs.url;
+    if (!obs.url || this.readPages.has(key)) return false;
+    this.readPages.add(key);
+    const result = await this.readBounded({ action: 'read' }, obs.handle).catch((err: unknown) => {
+      if (this.stopped) throw new StoppedError();
+      return { ok: false, message: describeError(err) };
+    });
+    record.notes.push(result.ok ? `AUTO-READ: the page was read from here to the end like a human (${result.message}). You are now at the bottom.` : `AUTO-READ skipped: ${result.message}`);
+    return result.ok;
+  }
+
   /** Один шаг цикла. */
   private async step(): Promise<StepResult> {
+    const level = this.currentLevel();
     const n = this.state.steps.length + 1;
     const record: StepRecord = { n, startedAt: this.deps.now(), url: '', reasoning: '', expectedOutcome: '', actions: [], warnings: [], notes: [] };
     const history = buildHistory(this.state.steps, this.state.extracted);
@@ -358,17 +437,24 @@ export class AgentRunner {
           boundary: this.cfg.boundary,
           maxActions: this.cfg.maxActions,
           maxRetries: 2,
-          contextTokens: this.cfg.contextTokens,
-          maxOutputTokens: this.cfg.maxOutputTokens,
+          contextTokens: level?.contextTokens ?? this.cfg.contextTokens,
+          maxOutputTokens: level?.maxOutputTokens ?? this.cfg.maxOutputTokens,
           history,
+          digest: buildDigest(this.state.steps, this.state.extracted),
+          resetPercent: this.cfg.contextResetPercent,
+          tokenRatio: this.tokenRatio,
           siteNotesFor: (url) => siteNotesFor(url, this.cfg.siteNotes),
         },
         {
-          observe: async () => {
-            obs = await this.deps.observe({ screenshot: needsScreenshot(this.cfg.screenshots, this.state.steps.at(-1)) });
+          observe: async (o) => {
+            // Картинки — только если модель текущей ступени их понимает.
+            const shot = (level?.vision ?? true) && needsScreenshot(this.cfg.screenshots, this.state.steps.at(-1));
+            obs = await this.deps.observe({ screenshot: shot, maxChars: o?.maxChars });
+            // Новая страница: сначала «читаем» её, потом смотрим на неё заново — модель увидит, где мы оказались.
+            if (await this.autoRead(obs, record)) obs = await this.deps.observe({ screenshot: shot, maxChars: o?.maxChars });
             return { observation: obs.observation, tabs: obs.tabs, url: obs.url, image: obs.image };
           },
-          chat: (messages, schema, onDelta, onRetry) => this.deps.chat(messages, schema, onDelta, onRetry, this.abort.signal),
+          chat: (messages, schema, onDelta, onRetry) => this.deps.chat(messages, schema, onDelta, onRetry, this.abort.signal, level?.id),
         },
         (e) => this.deps.onProgress(e),
       );
@@ -382,8 +468,13 @@ export class AgentRunner {
 
     const seen = obs as unknown as Observation;
     record.url = seen.url;
+    if (this.switchNote) record.notes.push(this.switchNote);
+    this.switchNote = null;
     record.warnings.push(...outcome.warnings);
+    for (const r of outcome.resets) record.notes.push(`CONTEXT RESET: ${r}`);
+    if (outcome.resets.length) this.state.contextResets = (this.state.contextResets ?? 0) + outcome.resets.length;
     const last = outcome.attempts.at(-1);
+    this.tokenRatio = updateTokenRatio(this.tokenRatio, last?.promptTokens, last?.promptTokensEstimate);
     if (last) {
       record.llm = {
         attempts: outcome.attempts.length,
@@ -393,6 +484,7 @@ export class AgentRunner {
         promptTokens: last.promptTokens,
         completionTokens: last.completionTokens,
         promptTokensEstimate: outcome.promptTokensEstimate,
+        ...(level ? { model: level.model, profile: level.label } : {}),
       };
     }
     if (!outcome.step) {
@@ -407,6 +499,7 @@ export class AgentRunner {
       const i = targetIndex(action);
       const ex: ExecutedAction = { action, target: i !== undefined ? elementLine(seen.observation, i) : undefined };
       if (action.action === 'drag') ex.toTarget = elementLine(seen.observation, action.to_index);
+      if (action.action === 'read' && action.to_index !== undefined) ex.toTarget = elementLine(seen.observation, action.to_index);
       return ex;
     });
 
@@ -637,7 +730,8 @@ export class AgentRunner {
       this.state.loop = this.loop.snapshot();
       await this.deps.checkpoint(this.state, record).catch(() => {});
       try {
-        ex.result = await withTimeout(this.deps.execute(a, handle), this.cfg.stepTimeoutSec * 1000, a.action);
+        // Чтение длится минутами по замыслу — у него свой потолок вместо шагового таймаута.
+        ex.result = a.action === 'read' ? await this.readBounded(a, handle) : await withTimeout(this.deps.execute(a, handle, this.abort.signal), this.cfg.stepTimeoutSec * 1000, a.action);
       } catch (err) {
         if (this.stopped) throw new StoppedError();
         ex.result = { ok: false, message: describeError(err) };
@@ -666,7 +760,8 @@ export class AgentRunner {
       runId: this.state.id,
       n: record.n,
       observation: obs?.observation ?? '',
-      history,
+      // После сброса контекста модель получила сводку, а не полную историю — в журнал пишем то, что ушло.
+      history: outcome?.history ?? history,
       siteNotes: outcome?.siteNotes || undefined,
       screenshot: outcome?.image,
       responses: outcome?.attempts.map((a) => ({ content: a.content, reasoning: a.reasoning, parseError: a.parseError })) ?? [],

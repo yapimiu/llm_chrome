@@ -1,3 +1,4 @@
+import type { EscalationState } from './escalation';
 import type { ElementFlag } from '../dom/types';
 import type { FrameNode } from '../frames';
 import type { StructuredFormat } from '../llm/client';
@@ -82,6 +83,9 @@ export interface StepLlmInfo {
   promptTokens?: number;
   completionTokens?: number;
   promptTokensEstimate: number;
+  /** Какая модель отвечала на этом шаге (важно при автосмене моделей). */
+  model?: string;
+  profile?: string;
 }
 
 /** Шаг в ленте (лёгкий — без наблюдения и сырых ответов). */
@@ -153,6 +157,10 @@ export interface RunState {
   restarts?: number;
   /** Детектор застревания (см. stuck.ts). */
   stuck?: StuckState;
+  /** Автосмена моделей: на какой ступени цепочки идёт запуск (см. escalation.ts). */
+  escalation?: EscalationState;
+  /** Сколько раз контекст сбрасывали при заполнении бюджета (см. context.ts). */
+  contextResets?: number;
 }
 
 /** Действие, отложенное в автономном режиме до подтверждения человеком («очередь на утро»). */

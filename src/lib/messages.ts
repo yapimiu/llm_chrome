@@ -3,7 +3,7 @@ import type { CourseState } from './agent/course';
 import type { Macro, ReplayState } from './agent/macro';
 import type { StepEvent } from './agent/step';
 import type { ActionResult, DeferredItem, RunState, RunSummary, StepDetail } from './agent/types';
-import type { ClickPoint } from './dom/act';
+import type { ClickPoint, ReadSource, ScrollInfo } from './dom/act';
 import type { Rect } from './dom/types';
 import type { FrameChildTag, RawFrameObservation } from './frames';
 import type { DomAction } from './dom/act';
@@ -74,11 +74,15 @@ export type ContentRequest =
   | { type: 'content:frame-info' }
   | { type: 'content:frame-box'; token: string }
   | { type: 'content:target-point'; snapshotId: number; index: number; noScroll?: boolean }
+  | { type: 'content:scroll-info'; snapshotId: number; index?: number }
+  | { type: 'content:read-plan'; snapshotId: number; from?: number; to?: number }
   | { type: 'content:focus-select'; snapshotId: number; index: number }
   | { type: 'content:read-value'; snapshotId: number; index: number }
   | { type: 'content:watch-start' }
   | { type: 'content:watch-end' }
   | { type: 'content:cursor'; x: number; y: number; durationMs: number; click: boolean }
+  /** Ближайшие ms мс рисовать курсор по настоящим событиям мыши (их шлёт CDP). */
+  | { type: 'content:cursor-follow'; ms: number }
   | { type: 'content:highlight'; enabled: boolean }
   /** Режим выбора элемента мышью; ответ приходит после клика (null — отмена по Esc). */
   | { type: 'content:pick'; maxChars: number; hide: string[] }
@@ -154,11 +158,14 @@ export interface ContentResponses {
   'content:frame-info': FrameInfo;
   'content:frame-box': Rect | null;
   'content:target-point': ClickPoint;
+  'content:scroll-info': ScrollInfo;
+  'content:read-plan': ReadSource;
   'content:focus-select': null;
   'content:read-value': string | null;
   'content:watch-start': null;
   'content:watch-end': { mutations: number };
   'content:cursor': null;
+  'content:cursor-follow': null;
   'content:highlight': null;
   'content:pick': Diagnosis | null;
   'content:pick-cancel': null;
@@ -207,7 +214,12 @@ export const isBackgroundRequest = (msg: unknown): msg is BackgroundRequest => h
 
 export async function sendToBackground<R extends BackgroundRequest>(req: R): Promise<Result<BackgroundResponses[R['type']]>> {
   try {
-    return (await browser.runtime.sendMessage(req)) as Result<BackgroundResponses[R['type']]>;
+    const res: unknown = await browser.runtime.sendMessage(req);
+    // Пустой ответ (null/undefined) — воркер перезапустился или расширение обновили, пока панель была открыта.
+    if (typeof res !== 'object' || res === null || typeof (res as { ok?: unknown }).ok !== 'boolean') {
+      return { ok: false, error: 'the extension did not respond (it was reloaded or restarted) — close and reopen the side panel' };
+    }
+    return res as Result<BackgroundResponses[R['type']]>;
   } catch (err) {
     return { ok: false, error: errorMessage(err) };
   }

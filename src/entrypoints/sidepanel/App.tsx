@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'preact/hooks';
 import { browser } from '#imports';
-import { activeProfile, loadSettings, saveSettings, watchSettings, type ProfileId, type Settings } from '@/lib/settings';
+import { activeProfile, loadSettings, profileOf, saveSettings, watchSettings, type ProfileId, type Settings } from '@/lib/settings';
 import { checkConnection, type ConnectionReport } from '@/lib/llm/connection';
 import { AgentPanel } from './AgentPanel';
 import { Perception } from './Perception';
@@ -41,9 +41,9 @@ export function App() {
     <main>
       <header>
         <select value={settings.activeProfile} onChange={(e) => switchProfile(e.currentTarget.value as ProfileId)}>
-          {(Object.keys(settings.profiles) as ProfileId[]).map((id) => (
+          {settings.profileIds.map((id) => (
             <option key={id} value={id}>
-              {settings.profiles[id].label} — {settings.profiles[id].model}
+              {profileOf(settings, id).label} — {profileOf(settings, id).model}
             </option>
           ))}
         </select>

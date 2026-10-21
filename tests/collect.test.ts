@@ -795,3 +795,37 @@ describe('кнопка отправки формы для поля', () => {
     expect(snapshot.elements.find((e) => e.name === 'Отправить')?.formSubmit).toBeUndefined();
   });
 });
+
+describe('пройденный тест: заблокированные варианты ответа', () => {
+  const quiz = (disabled: boolean) => `
+    <div data-rect="0 0 700 120">
+      <label data-rect="10 10 690 42"><input type="radio" name="q" checked ${disabled ? 'disabled' : ''} data-rect="20 20 13 13">Правильный ответ: по часовой стрелке</label>
+      <label data-rect="10 60 690 42"><input type="radio" name="q" ${disabled ? 'disabled' : ''} data-rect="20 70 13 13">Против часовой стрелки</label>
+    </div>
+    <button data-rect="10 130 200 40">К следующему уроку</button>`;
+
+  it('заблокированные варианты не попадают в список, кнопка дальше — получает номер [1]', () => {
+    const { snapshot } = collect(quiz(true));
+    expect(snapshot.elements.map((e) => e.name)).toEqual(['К следующему уроку']);
+  });
+
+  it('в тексте страницы видно, какой вариант был выбран', () => {
+    const text = line(quiz(true));
+    expect(text).toMatch(/✓ chosen, locked\)?\s*Правильный ответ: по часовой стрелке/);
+    expect(text).toContain('Против часовой стрелки');
+    expect(text.match(/chosen/g)).toHaveLength(1);
+  });
+
+  it('незаблокированный тест — варианты кликабельны, как раньше', () => {
+    const { snapshot } = collect(quiz(false));
+    expect(snapshot.elements.filter((e) => e.type === 'radio')).toHaveLength(2);
+  });
+
+  it('role=radio с aria-disabled тоже считается заблокированным; disabled-кнопка остаётся в списке', () => {
+    const { snapshot } = collect(`
+      <div role="radio" aria-checked="true" aria-disabled="true" data-rect="10 10 200 30">Вариант А</div>
+      <button disabled data-rect="10 50 200 30">Проверить</button>`);
+    expect(snapshot.elements.map((e) => e.name)).toEqual(['Проверить']);
+  });
+});
+

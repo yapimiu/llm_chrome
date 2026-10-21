@@ -51,7 +51,7 @@ export function StepCard({ step, runId }: { step: StepRecord; runId: string }) {
     <article class="card step-card">
       <header class="muted stats">
         Шаг {step.n} · {seconds(step.durationMs)}
-        {step.llm && ` · модель ${seconds(step.llm.totalMs)}${step.llm.attempts > 1 ? ` (${step.llm.attempts} попытки)` : ''}`} · {host(step.url)}
+        {step.llm && ` · ${step.llm.profile ? `${step.llm.profile}: ` : 'модель '}${seconds(step.llm.totalMs)}${step.llm.attempts > 1 ? ` (${step.llm.attempts} попытки)` : ''}`} · {host(step.url)}
       </header>
       {step.reasoning && <p>{step.reasoning}</p>}
       {step.actions.length > 0 && (
