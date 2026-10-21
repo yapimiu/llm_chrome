@@ -5,6 +5,7 @@ import { resumeTask, sameUrl, type RunCheckpoint } from '@/lib/agent/queue';
 import { assessAction, sitePolicyFor } from '@/lib/agent/risk';
 import { Skipper, type SkipState } from '@/lib/agent/skipper';
 import { Course, type CourseState, type SolveResult } from '@/lib/agent/course';
+import { remapLevel, type EscalationConfig } from '@/lib/agent/escalation';
 import { handoffTask, macroFromRun, Replayer, type Macro, type ReplayState } from '@/lib/agent/macro';
 import { deleteMacro, getMacro, listMacros, saveMacro } from '@/lib/agent/macro-store';
 import { hiddenNamesFor, nextRulesFor, type SiteNote } from '@/lib/agent/site-notes';
@@ -36,7 +37,7 @@ import { activeTab, isRestrictedUrl, observePage, setHighlight } from '@/lib/per
 import { captureTab } from '@/lib/screenshot';
 import { discoverChatId, isConfigured, TelegramBridge, TelegramClient } from '@/lib/notify/telegram';
 import { approvalText, finishText, questionText } from '@/lib/notify/format';
-import { activeProfile, loadSettings, type ProfileId, type Settings } from '@/lib/settings';
+import { activeProfile, isExternalProfile, loadSettings, modelLevels, profileOf, type ProfileId, type Settings } from '@/lib/settings';
 import { targetIndex } from '@/lib/agent/actions';
 import { executeAction, normalizeNavigateUrl, waitForTabLoad, type AgentTab, type ExecContext } from '@/lib/tab-actions';
 
@@ -167,6 +168,23 @@ function telegramSync(settings: Settings, runner: () => AgentRunner, url: () => 
   };
 }
 
+/** Цепочка моделей для запуска — всегда из текущих настроек (и при возобновлении: облако могли запретить). */
+function escalationConfig(settings: Settings): EscalationConfig {
+  return {
+    levels: modelLevels(settings).map((l) => ({
+      id: l.id,
+      label: l.profile.label,
+      model: l.profile.model,
+      contextTokens: l.profile.contextTokens,
+      maxOutputTokens: l.profile.maxOutputTokens,
+      vision: l.profile.vision,
+      external: isExternalProfile(l.profile),
+    })),
+    failStreak: settings.escalation.failStreak,
+    returnAfter: settings.escalation.returnAfter,
+  };
+}
+
 function runConfig(settings: Settings, task: string, overrides: Partial<RunConfig> = {}): RunConfig {
   const profile = activeProfile(settings);
   return {
@@ -177,6 +195,8 @@ function runConfig(settings: Settings, task: string, overrides: Partial<RunConfi
     maxActions: settings.agent.maxActionsPerStep,
     loopThreshold: settings.agent.loopThreshold,
     autoScrollAfter: settings.agent.autoScrollAfter,
+    autoRead: settings.agent.autoRead,
+    contextResetPercent: settings.agent.contextResetPercent,
     stepTimeoutSec: settings.agent.stepTimeoutSec,
     approveEachStep: settings.agent.approveEachStep,
     contextTokens: profile.contextTokens,
@@ -187,7 +207,11 @@ function runConfig(settings: Settings, task: string, overrides: Partial<RunConfi
     autonomous: settings.agent.autonomous,
     riskRules: settings.safety.rules,
     approvalWindowSec: settings.safety.approvalWindowSec,
-    screenshots: profile.vision ? settings.agent.screenshots : 'off',
+    // Картинки — по профилю каждой ступени (см. escalation.levels[].vision).
+    screenshots: settings.agent.screenshots,
+    escalation: escalationConfig(settings),
+    // Чтение длится минутами по замыслу; потолок — лимит чтения плюс запас на зависший браузер.
+    readTimeoutSec: settings.agent.autoReadMaxMin * 60 + 120,
     ...overrides,
   };
 }
@@ -197,7 +221,7 @@ function runConfig(settings: Settings, task: string, overrides: Partial<RunConfi
  * тогда конфиг берётся из чекпоинта, а адрес сервера и модель — из текущего профиля.
  */
 async function launch(settings: Settings, profileId: ProfileId, cfg: RunConfig, tab: AgentTab, restore?: RunState): Promise<RunState> {
-  const profile = settings.profiles[profileId];
+  const profile = profileOf(settings, profileId);
   const progress = throttledProgress();
   const remote = settings.logging.remoteEnabled && settings.logging.remoteUrl ? settings.logging.remoteUrl : null;
   await pruneRuns().catch(() => {});
@@ -210,6 +234,7 @@ async function launch(settings: Settings, profileId: ProfileId, cfg: RunConfig, 
     cdpUnavailable: () => debuggers?.unavailableReason ?? '',
     showCursor: settings.agent.showCursor,
     typing: { byKeys: settings.agent.typeByKeys, delayMs: settings.agent.typeDelayMs },
+    readMaxMs: settings.agent.autoReadMaxMin * 60_000,
   };
 
   const { systemTemplate: _sys, ...cfgToSave } = cfg;
@@ -225,9 +250,12 @@ async function launch(settings: Settings, profileId: ProfileId, cfg: RunConfig, 
   const runner: AgentRunner = new AgentRunner(
     cfg,
     {
-      observe: (opts) => observeAgentTab(tab, settings.agent.maxObservationChars, settings.agent.debugOverlay, cfg.siteNotes, opts?.screenshot ?? false),
-      chat: (messages, schema, onDelta, onRetry, signal) => chatStream({ profile, messages, schema, onDelta, onRetry, signal }),
-      execute: (action, handle) => executeAction(action, handle, exec),
+      observe: (opts) =>
+        observeAgentTab(tab, Math.min(settings.agent.maxObservationChars, opts?.maxChars ?? Infinity), settings.agent.debugOverlay, cfg.siteNotes, opts?.screenshot ?? false),
+      // Профиль ступени цепочки (автосмена моделей) или профиль запуска.
+      chat: (messages, schema, onDelta, onRetry, signal, levelId) =>
+        chatStream({ profile: levelId ? profileOf(settings, levelId) : profile, messages, schema, onDelta, onRetry, signal }),
+      execute: (action, handle, signal) => executeAction(action, handle, exec, signal),
       onState: (state) => {
         broadcast({ type: 'ui:run-state', info: { state, interrupted: false } });
         telegram?.(state);
@@ -315,6 +343,7 @@ async function startSkip(windowId: number): Promise<void> {
       cdpUnavailable: () => debuggers?.unavailableReason ?? '',
       showCursor: s.agent.showCursor,
       typing: { byKeys: s.agent.typeByKeys, delayMs: s.agent.typeDelayMs },
+      readMaxMs: s.agent.autoReadMaxMin * 60_000,
     };
     const skipper = new Skipper({
       observe: async () => {
@@ -395,7 +424,7 @@ const skipRunning = () => course?.state.status === 'running';
 // ——— сценарии: запись запуска и повтор без модели ———
 
 type ReplayReply = { approved?: boolean; text?: string | null };
-let replay: { replayer: Replayer; macro: Macro; state: ReplayState; waiter: ((r: ReplayReply) => void) | null } | null = null;
+let replay: { replayer: Replayer; macro: Macro; state: ReplayState; waiter: ((r: ReplayReply) => void) | null; abort: AbortController } | null = null;
 const replayRunning = () => replay?.state.status === 'running';
 
 async function saveRunAsMacro(runId: string, name: string): Promise<Macro> {
@@ -441,14 +470,17 @@ async function startReplay(id: string, windowId: number): Promise<void> {
     cdpUnavailable: () => debuggers?.unavailableReason ?? '',
     showCursor: s.agent.showCursor,
     typing: { byKeys: s.agent.typeByKeys, delayMs: s.agent.typeDelayMs },
+    readMaxMs: s.agent.autoReadMaxMin * 60_000,
   };
   const waitReply = () => new Promise<ReplayReply>((resolve) => replay && (replay.waiter = resolve));
+  // «Стоп» должен прерывать и долгие действия (read идёт минутами).
+  const abort = new AbortController();
   const replayer = new Replayer(macro, {
     observe: async () => {
       const obs = await observeAgentTab(tab, s.agent.maxObservationChars, false, s.siteNotes);
       return { url: obs.url, elements: obs.handle.elements ?? [], handle: obs.handle };
     },
-    execute: (action, handle) => executeAction(action, handle, exec),
+    execute: (action, handle) => executeAction(action, handle, exec, abort.signal),
     assess: (action, target, toTarget, obs) => {
       const i = targetIndex(action);
       return assessAction({
@@ -474,7 +506,7 @@ async function startReplay(id: string, windowId: number): Promise<void> {
       broadcast({ type: 'ui:macro-state', state });
     },
   });
-  replay = { replayer, macro, state: replayer.state, waiter: null };
+  replay = { replayer, macro, state: replayer.state, waiter: null, abort };
   const stopKeepAlive = startKeepAlive();
   void replayer.run().finally(() => {
     stopKeepAlive();
@@ -485,6 +517,7 @@ async function startReplay(id: string, windowId: number): Promise<void> {
 function stopReplay(): void {
   if (!replay) return;
   replay.replayer.stop();
+  replay.abort.abort();
   replay.waiter?.({ approved: false, text: null });
   replay.waiter = null;
 }
@@ -535,10 +568,16 @@ async function resumeInterrupted(): Promise<RunState> {
   if (current && !TERMINAL_STATUSES.has(current.runner.state.status)) throw new Error('Агент уже работает.');
   const { checkpoint, state } = interrupted;
   const settings = await loadSettings();
-  const profileId: ProfileId = checkpoint.profileId in settings.profiles ? (checkpoint.profileId as ProfileId) : settings.activeProfile;
+  const profileId: ProfileId = checkpoint.profileId in settings.profiles ? checkpoint.profileId : settings.activeProfile;
   const tab = await findAgentTab(checkpoint.tab);
   await browser.tabs.update(tab.tabId, { active: true }).catch(() => {});
-  return launch(settings, profileId, { ...checkpoint.cfg, systemTemplate }, tab, state);
+  // Цепочку моделей и потолок чтения — из текущих настроек, а не из чекпоинта: за ночь могли запретить облако.
+  const escalation = escalationConfig(settings);
+  state.escalation = remapLevel(state.escalation, checkpoint.cfg.escalation?.levels, escalation.levels);
+  const level = escalation.levels[state.escalation?.level ?? 0];
+  if (level) Object.assign(state, { profileLabel: level.label, model: level.model });
+  const cfg: RunConfig = { ...checkpoint.cfg, systemTemplate, escalation, readTimeoutSec: settings.agent.autoReadMaxMin * 60 + 120 };
+  return launch(settings, profileId, cfg, tab, state);
 }
 
 async function discardInterrupted(): Promise<void> {

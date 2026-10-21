@@ -51,7 +51,8 @@ function ancestry(el: Element): Element[] {
   return chain;
 }
 
-const SKIP_REASONS: Record<'tag' | 'ignored' | 'inert' | 'display-none' | 'user-hidden', string> = {
+const SKIP_REASONS: Record<'tag' | 'ignored' | 'inert' | 'display-none' | 'user-hidden' | 'locked', string> = {
+  locked: 'вариант ответа заблокирован (disabled) — тест уже пройден; в тексте страницы показан с пометкой, кликать его нельзя',
   'user-hidden': 'скрыт вашей заметкой для сайта («Скрыть от модели»)',
   tag: 'служебный тег (script/style/template…)',
   ignored: 'служебный элемент самого расширения',
@@ -101,7 +102,15 @@ export function diagnose(picked: Element, input: DiagnoseInput): Diagnosis {
           element,
           ok: false,
           verdict: `${self(el)} распознан как интерактивный, но считается невидимым.`,
-          details: ['checkVisibility() вернул false (display/visibility/opacity у него или предков) или размер ≤ 1px.'],
+          details: [
+            v.why === 'transparent'
+              ? 'Почти прозрачный: суммарная opacity его и предков меньше 0.1.'
+              : v.why === 'inside aria-hidden'
+                ? 'Лежит внутри aria-hidden="true" — сайт сам пометил этот блок как скрытый.'
+                : v.why
+                  ? `Обрезан предком: ${v.why} (overflow: hidden, свёрнутый блок, слайд за краем).`
+                  : 'checkVisibility() вернул false (display/visibility/opacity у него или предков) или размер ≤ 1px.',
+          ],
         };
       case 'offscreen':
         return {

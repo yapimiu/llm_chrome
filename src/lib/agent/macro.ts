@@ -80,7 +80,7 @@ export function macroFromRun(run: RunState, observations: ReadonlyMap<number, st
         step.target = ex.target;
         step.nth = nthOf(lines, i, ex.target);
       }
-      if (ex.action.action === 'drag' && ex.toTarget) {
+      if ((ex.action.action === 'drag' || ex.action.action === 'read') && ex.toTarget && ex.action.to_index !== undefined) {
         step.toTarget = ex.toTarget;
         step.toNth = nthOf(lines, ex.action.to_index, ex.toTarget);
       }
@@ -109,7 +109,7 @@ export function findElement(elements: readonly ElementBrief[], target: string, n
 export function rebind(action: AgentAction, index: number | undefined, toIndex: number | undefined): AgentAction {
   const a = structuredClone(action);
   if (index !== undefined && 'index' in a) (a as { index: number }).index = index;
-  if (toIndex !== undefined && a.action === 'drag') a.to_index = toIndex;
+  if (toIndex !== undefined && (a.action === 'drag' || a.action === 'read')) a.to_index = toIndex;
   return a;
 }
 

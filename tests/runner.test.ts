@@ -58,10 +58,10 @@ function harness(replies: (ChatResult | Error)[], opts: HarnessOpts = {}): Harne
   const h: Harness = { executed: [], states: [], chats: 0, deferred: [], alerts: [], checkpoints: [], deps: undefined as unknown as RunDeps };
   let page = 0;
   h.deps = {
-    observe: vi.fn(async () => {
+    observe: vi.fn(async (o?: { maxChars?: number }) => {
       const text = opts.pages?.[Math.min(page++, opts.pages.length - 1)] ?? `[1] button "В корзину"\n[2] input "Поиск"\npage ${page}`;
       return {
-        observation: text,
+        observation: o?.maxChars ? text.slice(0, o.maxChars) : text,
         tabs: [],
         handle: { frames: [{ frameId: 0, snapshotId: page }], owner: {}, nodes: [], flags: opts.flags },
         url: opts.url ?? 'https://shop.example/',
@@ -543,4 +543,157 @@ describe('AgentRunner', () => {
       expect(h.executed.map((a) => a.action)).toEqual(['type', 'type']);
     });
   });
+
+  describe('авточтение страницы', () => {
+    const readCalls = (h: Harness) => h.executed.filter((a) => a.action === 'read');
+
+    it('выключено — read не вызывается', async () => {
+      const h = harness([reply([{ action: 'done', result: 'ok' }])]);
+      await new AgentRunner(cfg, h.deps).run();
+      expect(readCalls(h)).toHaveLength(0);
+    });
+
+    it('включено — новая страница читается до выбора действия, затем наблюдение берётся заново, с пометкой в шаге', async () => {
+      const h = harness([reply([{ action: 'done', result: 'ok' }])]);
+      const runner = new AgentRunner({ ...cfg, autoRead: true }, h.deps);
+      const state = await runner.run();
+      expect(readCalls(h)).toEqual([{ action: 'read' }]);
+      expect(h.deps.observe).toHaveBeenCalledTimes(2);
+      expect(state.steps[0]!.notes.some((n) => n.startsWith('AUTO-READ:'))).toBe(true);
+    });
+
+    it('один адрес читается один раз за запуск; новый адрес — снова', async () => {
+      let url = 'https://a.example/';
+      const h = harness([
+        reply([{ action: 'click', index: 1 }]),
+        reply([{ action: 'click', index: 1 }]),
+        reply([{ action: 'done', result: 'ok' }]),
+      ]);
+      const baseObserve = h.deps.observe;
+      h.deps.observe = vi.fn(async (o) => ({ ...(await baseObserve(o)), url }));
+      const execute = h.deps.execute;
+      h.deps.execute = vi.fn(async (a, handle, signal) => {
+        if (a.action === 'click') url = 'https://b.example/';
+        return execute(a, handle, signal);
+      });
+      await new AgentRunner({ ...cfg, autoRead: true }, h.deps).run();
+      expect(readCalls(h)).toHaveLength(2);
+    });
+
+    it('сбой чтения (нет отладчика) не мешает шагу и попадает в пометку', async () => {
+      const h = harness([reply([{ action: 'done', result: 'ok' }])], { exec: (a) => (a.action === 'read' ? { ok: false, message: 'needs debugger' } : { ok: true, message: 'ok' }) });
+      const state = await new AgentRunner({ ...cfg, autoRead: true }, h.deps).run();
+      expect(state.status).toBe('done');
+      expect(state.steps[0]!.notes).toContain('AUTO-READ skipped: needs debugger');
+      expect(h.deps.observe).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('автосмена моделей', () => {
+    const lvl = (id: string, external = false, vision = false) => ({ id, label: id, model: `${id}-m`, contextTokens: 16000, maxOutputTokens: 700, vision, external });
+    const esc = { levels: [lvl('qwen'), lvl('big'), lvl('cloud', true)], failStreak: 2, returnAfter: 2 };
+    const fail = (a: AgentAction): ActionResult => (a.action === 'click' ? { ok: false, message: 'covered' } : { ok: true, message: 'ok' });
+
+    it('без настройки работает одна модель: chat без профиля ступени', async () => {
+      const h = harness([reply([{ action: 'done', result: 'ok' }])]);
+      await new AgentRunner(cfg, h.deps).run();
+      expect((h.deps.chat as ReturnType<typeof vi.fn>).mock.calls[0]![5]).toBeUndefined();
+    });
+
+    it('две неудачи подряд — следующий шаг идёт на сильной модели, с заметкой о смене; потом возврат', async () => {
+      const click = { action: 'click', index: 1 };
+      const h = harness(
+        [reply([click]), reply([click]), reply([{ action: 'type', index: 2, text: 'a', submit: false }]), reply([{ action: 'type', index: 2, text: 'b', submit: false }]), reply([{ action: 'type', index: 2, text: 'c', submit: false }]), reply([{ action: 'done', result: 'ok' }])],
+        { exec: fail },
+      );
+      const state = await new AgentRunner({ ...cfg, escalation: esc, loopThreshold: 9 }, h.deps).run();
+      const used = (h.deps.chat as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[5]);
+      expect(used).toEqual(['qwen', 'qwen', 'big', 'big', 'qwen', 'qwen']);
+      expect(state.steps[2]!.notes.some((n) => n.startsWith('MODEL SWITCH: qwen → big'))).toBe(true);
+      expect(state.steps[4]!.notes.some((n) => n.startsWith('MODEL SWITCH: big → qwen'))).toBe(true);
+      expect(state.steps[2]!.llm).toMatchObject({ model: 'big-m', profile: 'big' });
+      expect(state.profileLabel).toBe('qwen');
+    });
+
+    it('переход на внешнюю модель сопровождается уведомлением; на внутреннюю — нет', async () => {
+      const click = { action: 'click', index: 1 };
+      const h = harness([reply([click]), reply([click]), reply([click]), reply([click]), reply([{ action: 'done', result: 'ok' }])], { exec: fail });
+      await new AgentRunner({ ...cfg, escalation: esc, loopThreshold: 9 }, h.deps).run();
+      expect(h.alerts).toHaveLength(1);
+      expect(h.alerts[0]).toMatch(/cloud/);
+    });
+
+    it('зацикливание переводит на сильную модель сразу и даёт ей чистый счётчик повторов', async () => {
+      const same = reply([{ action: 'click', index: 1 }]);
+      const h = harness([same, same, reply([{ action: 'done', result: 'ok' }])]);
+      const state = await new AgentRunner({ ...cfg, escalation: esc, loopThreshold: 2 }, h.deps).run();
+      const used = (h.deps.chat as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[5]);
+      expect(used[0]).toBe('qwen');
+      expect(used.at(-1)).toBe('big');
+      expect(state.status).toBe('done');
+    });
+
+    it('ступень запоминается в состоянии — после перезапуска запуск продолжается на той же модели', async () => {
+      const click = { action: 'click', index: 1 };
+      const h = harness([reply([click]), reply([click]), reply([{ action: 'done', result: 'ok' }])], { exec: fail });
+      const state = await new AgentRunner({ ...cfg, escalation: esc, loopThreshold: 9 }, h.deps).run();
+      expect(state.escalation?.level).toBe(1);
+    });
+
+    it('картинки — только если модель текущей ступени их понимает', async () => {
+      const withVision = { levels: [lvl('qwen', false, false), lvl('big', false, true)], failStreak: 1, returnAfter: 9 };
+      const click = { action: 'click', index: 1 };
+      const h = harness([reply([click]), reply([{ action: 'done', result: 'ok' }])], { exec: fail });
+      await new AgentRunner({ ...cfg, screenshots: 'always', escalation: withVision, loopThreshold: 9 }, h.deps).run();
+      const shots = (h.deps.observe as ReturnType<typeof vi.fn>).mock.calls.map((c) => (c[0] as { screenshot: boolean }).screenshot);
+      expect(shots).toEqual([false, true]);
+    });
+  });
+
+  describe('автосброс контекста', () => {
+    const big = `[1] button "В корзину"\n${'длинный текст страницы '.repeat(900)}`;
+
+    it('страница не влезает в бюджет — снимается заново покороче, в шаге заметка, счётчик сбросов растёт', async () => {
+      const h = harness([reply([{ action: 'done', result: 'ok' }])], { pages: [big] });
+      const state = await new AgentRunner({ ...cfg, contextTokens: 6000, maxOutputTokens: 500, contextResetPercent: 85 }, h.deps).run();
+      const calls = (h.deps.observe as ReturnType<typeof vi.fn>).mock.calls.map((c) => (c[0] as { maxChars?: number } | undefined)?.maxChars);
+      expect(calls[0]).toBeUndefined();
+      expect(typeof calls[1]).toBe('number');
+      expect(state.steps[0]!.notes.some((n) => n.startsWith('CONTEXT RESET: page text shortened'))).toBe(true);
+      expect(state.contextResets).toBeGreaterThanOrEqual(1);
+    });
+
+    it('выключено (0) или всё влезает — сброса нет', async () => {
+      const off = harness([reply([{ action: 'done', result: 'ok' }])], { pages: [big] });
+      const s1 = await new AgentRunner({ ...cfg, contextTokens: 6000, contextResetPercent: 0 }, off.deps).run();
+      expect(s1.contextResets).toBeUndefined();
+      const fits = harness([reply([{ action: 'done', result: 'ok' }])]);
+      const s2 = await new AgentRunner({ ...cfg, contextResetPercent: 85 }, fits.deps).run();
+      expect(s2.contextResets).toBeUndefined();
+    });
+  });
+
+  describe('read: потолок времени и пошаговый режим', () => {
+    it('зависшее чтение обрывается по потолку, и прокрутке подаётся сигнал остановки', async () => {
+      let signal: AbortSignal | undefined;
+      const h = harness([reply([{ action: 'read' }]), reply([{ action: 'done', result: 'ok' }])]);
+      h.deps.execute = vi.fn(async (a: AgentAction, _handle, s?: AbortSignal) => {
+        if (a.action !== 'read') return { ok: true, message: 'ok' };
+        signal = s;
+        return new Promise<ActionResult>(() => {});
+      });
+      const state = await new AgentRunner({ ...cfg, readTimeoutSec: 0.05 }, h.deps).run();
+      expect(state.steps[0]!.actions[0]!.result).toMatchObject({ ok: false, message: expect.stringMatching(/read timed out/) });
+      expect(signal?.aborted).toBe(true);
+      expect(state.status).toBe('done');
+    });
+
+    it('в пошаговом режиме read не требует подтверждения, как и scroll', async () => {
+      const h = harness([reply([{ action: 'read' }]), reply([{ action: 'done', result: 'ok' }])]);
+      const state = await new AgentRunner({ ...cfg, approveEachStep: true }, h.deps).run();
+      expect(state.status).toBe('done');
+      expect(h.executed.map((a) => a.action)).toEqual(['read']);
+    });
+  });
 });
+

@@ -1,8 +1,10 @@
 import { browser } from '#imports';
 import { targetIndex, type AgentAction } from './agent/actions';
 import type { ActionResult, ObservationHandle } from './agent/types';
-import { isDomAction, NO_EFFECT_NOTE, valueHasText, type DomAction } from './dom/act';
+import { isDomAction, NO_EFFECT_NOTE, readTopFor, valueHasText, type DomAction } from './dom/act';
+import { planReading } from './dom/reading';
 import type { CdpDriver, Point } from './exec/cdp';
+import type { ContentRequest } from './messages';
 import { ensureContentScript, frameOffset, isRestrictedUrl, sendToContent } from './perception';
 
 /** Только http(s); «example.com» → «https://example.com». null — недопустимый адрес. */
@@ -53,6 +55,8 @@ export interface ExecContext {
   showCursor: boolean;
   /** Ввод по буквам (только с CDP); не задано — вставка строки целиком. */
   typing?: { byKeys: boolean; delayMs: number };
+  /** Потолок времени одного чтения (мс); не задан — по умолчанию из reading.ts. */
+  readMaxMs?: number;
 }
 
 /**
@@ -60,8 +64,9 @@ export interface ExecContext {
  * иначе DOM-событиями в content script; переходы и вкладки — через API вкладок.
  * При открытии новой вкладки (ссылка target=_blank, new_tab, switch_tab) меняет ctx.tab.tabId.
  */
-export async function executeAction(action: AgentAction, handle: ObservationHandle, ctx: ExecContext): Promise<ActionResult> {
+export async function executeAction(action: AgentAction, handle: ObservationHandle, ctx: ExecContext, signal?: AbortSignal): Promise<ActionResult> {
   const { tab } = ctx;
+  if (action.action === 'read') return executeRead(action, handle, ctx, signal);
   if (isDomAction(action)) return executeDom(action, handle, ctx);
 
   switch (action.action) {
@@ -122,8 +127,8 @@ function locate(action: DomAgentAction, handle: ObservationHandle, index = targe
   return snapshotId === undefined ? 'the page state is outdated; look at the new page state' : { frameId, snapshotId };
 }
 
-/** Действия, которым нужны настоящие события мыши и клавиатуры (CDP); select, прокрутка и ожидание — через DOM. */
-const CDP_ACTIONS: ReadonlySet<AgentAction['action']> = new Set(['click', 'type', 'hover', 'drag', 'press_key']);
+/** Действия, которым нужны настоящие события мыши и клавиатуры (CDP); select и ожидание — через DOM; прокрутка — колесом мыши (CDP), без него DOM-прокруткой. */
+const CDP_ACTIONS: ReadonlySet<AgentAction['action']> = new Set(['click', 'type', 'hover', 'drag', 'press_key', 'scroll']);
 
 async function executeDom(action: DomAgentAction, handle: ObservationHandle, ctx: ExecContext): Promise<ActionResult> {
   const { tab } = ctx;
@@ -150,6 +155,7 @@ async function executeDom(action: DomAgentAction, handle: ObservationHandle, ctx
     else if (driver && action.action === 'type') result = await cdpType(action, where, handle, ctx, driver);
     else if (driver && action.action === 'hover') result = await cdpHover(action.index, where, handle, ctx, driver);
     else if (driver && action.action === 'drag') result = await cdpDrag(action, where, handle, ctx, driver);
+    else if (driver && action.action === 'scroll') result = await cdpScroll(action, where, handle, ctx, driver);
     else if (driver && action.action === 'press_key') {
       await driver.pressKey(action.key);
       result = { ok: true, message: `pressed ${action.key}` };
@@ -208,6 +214,15 @@ function animateCursor(ctx: ExecContext, p: Point): Promise<void> {
   );
 }
 
+/** Окно, в течение которого курсор повторяет настоящую мышь; обновляется перед каждым CDP-действием. */
+const FOLLOW_MS = 15_000;
+
+/** Включает во всех фреймах вкладки показ курсора по настоящим событиям мыши. */
+async function followCursor(ctx: ExecContext): Promise<void> {
+  if (!ctx.showCursor) return;
+  await browser.tabs.sendMessage(ctx.tab.tabId, { type: 'content:cursor-follow', ms: FOLLOW_MS } satisfies ContentRequest).catch(() => {});
+}
+
 /** Курсор для DOM-клика (без CDP) — чтобы было видно, куда нажимает агент. */
 async function showCursorAt(index: number, where: Located, handle: ObservationHandle, ctx: ExecContext): Promise<void> {
   const p = await topPoint(index, where, handle, ctx).catch(() => null);
@@ -230,15 +245,154 @@ async function cdpClick(index: number, where: Located, handle: ObservationHandle
   const p = await topPoint(index, where, handle, ctx);
   if (typeof p === 'string') return { ok: false, message: p };
   const settled = await watchFrames(ctx, where.frameId);
-  await Promise.all([animateCursor(ctx, p), driver.click(p)]);
+  await followCursor(ctx);
+  await driver.click(p);
   const mutations = await settled();
   return { ok: true, message: mutations === 0 ? `clicked, ${NO_EFFECT_NOTE}` : 'clicked' };
+}
+
+/** Пауза, которую можно прервать (кнопка «Стоп»): проверяем сигнал каждые полсекунды. */
+async function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  for (let left = ms; left > 0; left -= 500) {
+    if (signal?.aborted) throw new Error('stopped');
+    await sleep(Math.min(500, left));
+  }
+  if (signal?.aborted) throw new Error('stopped');
+}
+
+const fmtDuration = (ms: number) => {
+  const s = Math.round(ms / 1000);
+  return s >= 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s} s`;
+};
+
+/**
+ * Чтение: колесо мыши медленно ведёт страницу от одного места к другому в темпе человека,
+ * который читает (лёгкий текст быстрее, код и селекторы — медленнее), со случайными остановками.
+ * Нужен CDP: ждать минутами синтетическую прокрутку нет смысла — страница её не отличит.
+ */
+async function executeRead(
+  action: Extract<AgentAction, { action: 'read' }>,
+  handle: ObservationHandle,
+  ctx: ExecContext,
+  signal?: AbortSignal,
+): Promise<ActionResult> {
+  const { tabId } = ctx.tab;
+  const before = await browser.tabs.get(tabId);
+  if (isRestrictedUrl(before.url)) return { ok: false, message: 'this page cannot be controlled; navigate to a website first' };
+  for (const i of [action.index, action.to_index]) {
+    if (i === undefined) continue;
+    const owner = handle.owner[i];
+    if (owner === undefined) return { ok: false, message: `element [${i}] does not exist in the current page state` };
+    if (owner !== 0) return { ok: false, message: `element [${i}] is inside an embedded frame — reading works on the main page; use scroll there` };
+  }
+  const driver = ctx.cdp ? await ctx.cdp(tabId) : null;
+  if (!driver) return { ok: false, message: `reading needs real mouse wheel events (debugger): ${ctx.cdpUnavailable?.() || 'unavailable'}; use scroll instead` };
+  const snapshotId = handle.frames.find((f) => f.frameId === 0)?.snapshotId;
+  if (snapshotId === undefined) return { ok: false, message: 'the page state is outdated; look at the new page state' };
+
+  await ensureContentScript(tabId, before.url);
+  const src = await sendToContent(tabId, { type: 'content:read-plan', snapshotId, from: action.index, to: action.to_index }, 0);
+  if (!src.ok) return { ok: false, message: src.message };
+  const plan = planReading(src.segments, src.from, src.to, action.pace ?? 'auto', Math.random, ctx.readMaxMs);
+  if (plan.steps.length === 0) return { ok: false, message: 'there is no text between these places' };
+
+  const at = { x: src.x, y: src.y };
+  // Колесо — если под мышью именно страница; иначе (в центре вложенный скролл, фрейм) — прямая прокрутка.
+  const move = async (dy: number) => {
+    if (src.wheel) return driver.wheel(at, dy);
+    const amount = Math.abs(dy) / Math.max(1, src.viewport * 0.8);
+    await sendToContent(tabId, { type: 'content:act', action: { action: 'scroll', direction: dy > 0 ? 'down' : 'up', amount }, snapshotId }, 0);
+  };
+  // Сначала быстро подводим начало текста к строке чтения, затем читаем.
+  const startTop = Math.min(src.target, readTopFor(src.from, src.viewport));
+  if (Math.abs(startTop - src.top) > 4) await move(startTop - src.top);
+  await sleepAbortable(400, signal);
+  let scrolled = 0;
+  for (const step of plan.steps) {
+    if (signal?.aborted) throw new Error('stopped');
+    if (src.wheel) await followCursor(ctx);
+    await move(step.deltaY);
+    scrolled += step.deltaY;
+    await sleepAbortable(step.waitMs, signal);
+  }
+
+  // Страница могла дорисоваться по дороге — довод до конца, если не дошли.
+  const info = await sendToContent(tabId, { type: 'content:scroll-info', snapshotId }, 0).catch(() => null);
+  if (info?.ok) {
+    const expected = Math.min(src.target, startTop + scrolled);
+    if (Math.abs(info.top - expected) > 60) await move(expected - info.top);
+  }
+  const where = `${action.index !== undefined ? `[${action.index}]` : 'here'} → ${action.to_index !== undefined ? `[${action.to_index}]` : 'the end of the page'}`;
+  const pct = (x: number) => `${Math.round(x * 100)}%`;
+  const mix = `${pct(plan.carefulShare)} code/technical read slowly, ${pct(plan.junkShare)} off-topic skimmed`;
+  return { ok: true, message: `read ${where}: ~${plan.chars} characters in ${fmtDuration(plan.totalMs)} (${mix})${plan.capped ? ', shortened to the time limit' : ''}` };
+}
+
+/** Сколько раз и как часто проверять, что плавная прокрутка браузера закончилась. */
+const SCROLL_SETTLE_POLLS = 8;
+const SCROLL_SETTLE_MS = 80;
+
+/**
+ * Прокрутка колесом мыши (CDP): мышь встаёт над областью прокрутки (или над элементом index),
+ * браузер сам решает, что листать. Результат меряем по смещению — как у DOM-прокрутки.
+ */
+async function cdpScroll(
+  action: Extract<AgentAction, { action: 'scroll' }>,
+  where: Located,
+  handle: ObservationHandle,
+  ctx: ExecContext,
+  driver: CdpDriver,
+): Promise<ActionResult> {
+  const { tabId } = ctx.tab;
+  const info = await sendToContent(tabId, { type: 'content:scroll-info', snapshotId: where.snapshotId, index: action.index }, where.frameId);
+  if (!info.ok) return { ok: false, message: info.message };
+  // Под любой точкой области — вложенный скролл, фрейм или карта: колесо прокрутило бы их, а не то, что нужно.
+  const domScroll = () => sendToContent(tabId, { type: 'content:act', action, snapshotId: where.snapshotId }, where.frameId);
+  if (!info.wheel) return domScroll();
+  const off = await frameOffset(tabId, handle.nodes, where.frameId);
+  const at = { x: info.x + off.x, y: info.y + off.y };
+  const delta = (action.direction === 'down' ? 1 : -1) * action.amount * info.page * 0.8;
+
+  // Позицию читаем у целевого фрейма и у верхней страницы: колесо может докрутить и родителя.
+  const frames = [...new Set([0, where.frameId])];
+  const position = async (): Promise<number> => {
+    let sum = 0;
+    for (const frameId of frames) {
+      const snapshotId = handle.frames.find((f) => f.frameId === frameId)?.snapshotId;
+      if (snapshotId === undefined) continue;
+      const index = frameId === where.frameId ? action.index : undefined;
+      const r = await sendToContent(tabId, { type: 'content:scroll-info', snapshotId, index }, frameId).catch(() => null);
+      if (r?.ok) sum += r.top;
+    }
+    return sum;
+  };
+
+  const before = await position();
+  const settled = await watchFrames(ctx, where.frameId);
+  await followCursor(ctx);
+  await driver.wheel(at, delta);
+  await settled();
+  // Браузер прокручивает плавно, уже после последнего события колеса — ждём, пока позиция перестанет меняться.
+  let after = await position();
+  for (let i = 0; i < SCROLL_SETTLE_POLLS; i++) {
+    await sleep(SCROLL_SETTLE_MS);
+    const now = await position();
+    if (now === after) break;
+    after = now;
+  }
+
+  const moved = Math.abs(after - before);
+  // Колесо ничего не сдвинуло: это край или колесо съел виджет страницы. Проверяем прямой прокруткой —
+  // ложное «уже внизу» заставит модель решить, что страница кончилась.
+  if (moved < 1) return domScroll();
+  return { ok: true, message: `scrolled ${action.index !== undefined ? 'the area ' : ''}${action.direction} by ${Math.round(moved)}px` };
 }
 
 async function cdpHover(index: number, where: Located, handle: ObservationHandle, ctx: ExecContext, driver: CdpDriver): Promise<ActionResult> {
   const p = await topPoint(index, where, handle, ctx);
   if (typeof p === 'string') return { ok: false, message: p };
   const settled = await watchFrames(ctx, where.frameId);
+  await followCursor(ctx);
   await driver.moveTo(p);
   const mutations = await settled();
   return { ok: true, message: mutations === 0 ? `hovered, ${NO_EFFECT_NOTE}` : 'hovered' };
@@ -259,6 +413,7 @@ async function cdpDrag(
   const to = await topPoint(action.to_index, target, handle, ctx, true);
   if (typeof to === 'string') return { ok: false, message: `drop target: ${to} — both elements must be visible at once (scroll first)` };
   const settled = await watchFrames(ctx, where.frameId);
+  await followCursor(ctx);
   await driver.drag(from, to);
   const mutations = await settled();
   return { ok: true, message: mutations === 0 ? `dragged, ${NO_EFFECT_NOTE}` : 'dragged' };
@@ -274,7 +429,8 @@ async function cdpType(
   const p = await topPoint(action.index, where, handle, ctx);
   if (typeof p === 'string') return { ok: false, message: p };
   // Настоящий клик даёт фокус (в том числе редактору кода в iframe), затем заменяем содержимое.
-  await Promise.all([animateCursor(ctx, p), driver.click(p)]);
+  await followCursor(ctx);
+  await driver.click(p);
   await sendToContent(ctx.tab.tabId, { type: 'content:focus-select', snapshotId: where.snapshotId, index: action.index }, where.frameId);
   await driver.selectAll();
   // Редактор кода сам закрывает скобки и ставит отступы — по буквам туда вводить нельзя, только вставкой.

@@ -79,10 +79,10 @@ describe('прочее', () => {
     expect(estimateTokens([{ role: 'user', content: 'x'.repeat(3000) }])).toBeGreaterThan(1000);
   });
 
-  it('схема ответа: лимит действий и все 16 вариантов', () => {
+  it('схема ответа: лимит действий и все 17 вариантов', () => {
     const schema = agentResponseSchema(4) as { properties: { actions: { maxItems: number; items: { anyOf: unknown[] } } } };
     expect(schema.properties.actions.maxItems).toBe(4);
-    expect(schema.properties.actions.items.anyOf).toHaveLength(16);
+    expect(schema.properties.actions.items.anyOf).toHaveLength(17);
   });
 });
 

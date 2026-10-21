@@ -35,3 +35,27 @@ export function waitForStable(doc: Document, opts: StableOptions = DEFAULT_STABL
     const hard = setTimeout(() => finish(true), opts.timeoutMs);
   });
 }
+
+/** Анимации длиннее этого (и бесконечные — спиннеры, бегущие строки) не ждём. */
+const MAX_ANIMATION_MS = 5000;
+
+/**
+ * Ждёт окончания CSS-переходов и анимаций (document.getAnimations), но не дольше timeoutMs.
+ * DOM в это время не меняется, поэтому waitForStable их не видит, а снимок посреди анимации
+ * ловит полусвёрнутые блоки: нажатая реплика ещё видна и попадает в список — модель жмёт её снова.
+ * Возвращает, сколько анимаций ещё шло, когда ждать перестали.
+ */
+export async function waitForAnimations(doc: Pick<Document, 'getAnimations'>, timeoutMs = 1500): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const running = (doc.getAnimations?.() ?? []).filter((a) => {
+      if (a.playState !== 'running') return false;
+      const end = Number(a.effect?.getComputedTiming().endTime ?? Infinity);
+      return Number.isFinite(end) && end <= MAX_ANIMATION_MS;
+    });
+    const left = deadline - Date.now();
+    if (running.length === 0 || left <= 0) return running.length;
+    await Promise.race([Promise.all(running.map((a) => a.finished.catch(() => undefined))), new Promise((r) => setTimeout(r, left))]);
+  }
+}
+

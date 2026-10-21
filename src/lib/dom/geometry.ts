@@ -1,3 +1,4 @@
+import { paintVerdict, type PaintVerdict } from './paint';
 import type { Rect } from './types';
 
 export interface Viewport {
@@ -41,6 +42,13 @@ export interface Geometry {
   viewport(): Viewport;
   /** Метрики прокрутки элемента (для поиска внутреннего контейнера прокрутки SPA). */
   scrollBox(el: Element): ScrollBox;
+  /**
+   * Нарисован ли элемент и чем его обрезают предки (см. paint.ts). Необязательно: без него
+   * (тестовая геометрия) считается, что ничего не обрезано.
+   */
+  paint?(el: Element): PaintVerdict;
+  /** Прямоугольники строк строчного элемента, перенесённого на несколько строк; иначе пусто. */
+  fragments?(el: Element): Rect[];
 }
 
 function computed(el: Element): CSSStyleDeclaration | null {
@@ -65,6 +73,33 @@ export function browserGeometry(win: Window): Geometry {
       }
       const cs = computed(el);
       return !!cs && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+    },
+    paint(el) {
+      return paintVerdict(el, {
+        style(e) {
+          const cs = computed(e);
+          return {
+            position: cs?.position ?? 'static',
+            overflowX: cs?.overflowX ?? 'visible',
+            overflowY: cs?.overflowY ?? 'visible',
+            opacity: cs?.opacity ?? '1',
+            transform: cs?.transform ?? 'none',
+            contain: cs?.contain ?? 'none',
+          };
+        },
+        clientBox(e) {
+          const r = e.getBoundingClientRect();
+          const h = e as HTMLElement;
+          // У строчных элементов clientWidth = 0 — берём рамку целиком.
+          if (!h.clientWidth && !h.clientHeight) return { x: r.left, y: r.top, width: r.width, height: r.height };
+          return { x: r.left + h.clientLeft, y: r.top + h.clientTop, width: h.clientWidth, height: h.clientHeight };
+        },
+      });
+    },
+    fragments(el) {
+      if (computed(el)?.display !== 'inline') return [];
+      const rects = Array.from(el.getClientRects()).filter((r) => r.width > 1 && r.height > 1);
+      return rects.length > 1 ? rects.map((r) => ({ x: r.left, y: r.top, width: r.width, height: r.height })) : [];
     },
     rect(el) {
       const r = el.getBoundingClientRect();

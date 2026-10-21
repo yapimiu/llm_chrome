@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { findClickPoint, NO_EFFECT_NOTE, performAndSettle, performDomAction, readFieldValue, selectFieldContent, scrollableAncestor, setNativeValue, valueHasText, waitForText, type ActContext } from '@/lib/dom/act';
+import { findClickPoint, NO_EFFECT_NOTE, scrollInfo, performAndSettle, performDomAction, readFieldValue, selectFieldContent, scrollableAncestor, setNativeValue, valueHasText, waitForText, type ActContext } from '@/lib/dom/act';
 import type { Geometry } from '@/lib/dom/geometry';
 import type { RegistryEntry } from '@/lib/dom/collect';
 import { waitForStable } from '@/lib/dom/stable';
@@ -358,3 +358,82 @@ describe('новые действия без CDP', () => {
     expect(await waitForText(document, 'нет такого', 50, 10)).toMatchObject({ ok: false });
   });
 });
+
+describe('scrollInfo — куда навести мышь для прокрутки колесом', () => {
+  function geom(rects: Map<Element, { x: number; y: number; width: number; height: number }>): Geometry {
+    return {
+      rect: (el: Element) => rects.get(el) ?? { x: 0, y: 0, width: 0, height: 0 },
+      viewport: () => ({ width: 1000, height: 800, scrollX: 0, scrollY: 0, scrollHeight: 3000 }),
+      hitTest: () => document.querySelector('p') ?? document.body,
+    } as unknown as Geometry;
+  }
+
+  it('без номера и без внутренней области — центр окна, высота экрана и позиция окна', () => {
+    const r = scrollInfo(undefined, ctxFor(), geom(new Map()));
+    expect(r).toMatchObject({ ok: true, x: 500, y: 400, page: window.innerHeight, top: window.scrollY });
+  });
+
+  it('с внутренним scroller — центр его видимой части и его высота', () => {
+    document.body.innerHTML = '<main></main>';
+    const main = document.querySelector('main')!;
+    Object.defineProperty(main, 'clientHeight', { value: 600 });
+    Object.defineProperty(main, 'scrollTop', { value: 120, writable: true });
+    const ctx: ActContext = { registry: [], scroller: main, win: window };
+    const r = scrollInfo(undefined, ctx, geom(new Map([[main, { x: 200, y: 100, width: 600, height: 1500 }]])));
+    expect(r).toMatchObject({ ok: true, x: 500, y: 450, page: 600, top: 120 + window.scrollY });
+  });
+
+  it('с номером элемента внутри прокручиваемого блока — наводим на блок', () => {
+    document.body.innerHTML = '<div id="list" style="overflow-y:auto"><p>x</p></div>';
+    const list = document.querySelector('#list')!;
+    const p = document.querySelector('p')!;
+    Object.defineProperty(list, 'scrollHeight', { value: 2000 });
+    Object.defineProperty(list, 'clientHeight', { value: 300 });
+    const r = scrollInfo(1, ctxFor(p), geom(new Map([[list, { x: 0, y: 0, width: 400, height: 300 }]])));
+    expect(r).toMatchObject({ ok: true, x: 200, y: 150, page: 300 });
+  });
+
+  it('несуществующий номер — понятная ошибка', () => {
+    expect(scrollInfo(9, ctxFor(), geom(new Map()))).toMatchObject({ ok: false, message: expect.stringMatching(/does not exist/) });
+  });
+});
+
+describe('scrollInfo — точка для колеса', () => {
+  function geomHit(hit: (x: number, y: number) => Element | null): Geometry {
+    return {
+      rect: () => ({ x: 0, y: 0, width: 0, height: 0 }),
+      viewport: () => ({ width: 1000, height: 800, scrollX: 0, scrollY: 0, scrollHeight: 3000 }),
+      hitTest: (_root: unknown, x: number, y: number) => hit(x, y),
+    } as unknown as Geometry;
+  }
+  const scrollable = (el: HTMLElement) => {
+    el.style.overflowY = 'auto';
+    Object.defineProperty(el, 'scrollHeight', { value: 2000 });
+    Object.defineProperty(el, 'clientHeight', { value: 200 });
+  };
+
+  it('в центре вложенный блок с прокруткой (код) — колесо ставим в другое место страницы', () => {
+    document.body.innerHTML = '<p id="text">текст</p><div id="code"><pre>код</pre></div>';
+    const code = document.querySelector<HTMLElement>('#code')!;
+    scrollable(code);
+    const text = document.querySelector('#text')!;
+    const r = scrollInfo(undefined, ctxFor(), geomHit((x, y) => (x === 500 && y === 400 ? code.firstElementChild : text)));
+    expect(r).toMatchObject({ ok: true, wheel: true });
+    if (r.ok) expect([r.x, r.y]).not.toEqual([500, 400]);
+  });
+
+  it('везде фреймы и карты — колесо небезопасно, будет прямая прокрутка', () => {
+    document.body.innerHTML = '<iframe></iframe><div class="leaflet-container"><span>карта</span></div>';
+    const frame = document.querySelector('iframe')!;
+    const map = document.querySelector('span')!;
+    const r = scrollInfo(undefined, ctxFor(), geomHit((x) => (x < 500 ? frame : map)));
+    expect(r).toMatchObject({ ok: true, wheel: false, x: 500, y: 400 });
+  });
+
+  it('обычная страница — центр, колесо можно', () => {
+    document.body.innerHTML = '<p>текст</p>';
+    const p = document.querySelector('p')!;
+    expect(scrollInfo(undefined, ctxFor(), geomHit(() => p))).toMatchObject({ ok: true, wheel: true, x: 500, y: 400 });
+  });
+});
+

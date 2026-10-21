@@ -29,7 +29,7 @@ export function actionSignature(actions: readonly ExecutedAction[]): string {
   return JSON.stringify(
     actions.map((a) => {
       const by = 'index' in a.action ? { ...a.action, index: a.target ?? a.action.index } : a.action;
-      return a.action.action === 'drag' ? { ...by, to_index: a.toTarget ?? a.action.to_index } : by;
+      return a.action.action === 'drag' || a.action.action === 'read' ? { ...by, to_index: a.toTarget ?? a.action.to_index } : by;
     }),
   );
 }
@@ -60,6 +60,12 @@ export class LoopDetector {
   /** Состояние для чекпоинта. */
   snapshot(): LoopSnapshot {
     return { last: this.last, count: this.count };
+  }
+
+  /** Смена модели — новая попытка: прежние повторы ей не засчитываются. */
+  reset(): void {
+    this.last = null;
+    this.count = 0;
   }
 
   get repeats(): number {

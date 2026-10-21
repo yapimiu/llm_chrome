@@ -4,8 +4,8 @@ export interface OverlayItem {
   index: number;
   /** Подпись рамки; по умолчанию — номер. */
   label?: string;
-  /** Текущий прямоугольник в координатах вьюпорта (вызывается при каждой перерисовке). */
-  rect: () => Rect;
+  /** Текущий прямоугольник в координатах вьюпорта (вызывается при каждой перерисовке); null — элемент сейчас не виден. */
+  rect: () => Rect | null;
 }
 
 const HOST_TAG = 'llm-agent-overlay';
@@ -43,6 +43,8 @@ export class DebugOverlay {
     const win = this.doc.defaultView;
     win?.removeEventListener('scroll', this.onChange, true);
     win?.removeEventListener('resize', this.onChange);
+    this.doc.removeEventListener('transitionend', this.onChange, true);
+    this.doc.removeEventListener('animationend', this.onChange, true);
     if (this.frame) win?.cancelAnimationFrame(this.frame);
     this.frame = 0;
     this.host.remove();
@@ -74,6 +76,9 @@ export class DebugOverlay {
     const win = this.doc.defaultView;
     win?.addEventListener('scroll', this.onChange, { capture: true, passive: true });
     win?.addEventListener('resize', this.onChange, { passive: true });
+    // Блок свернулся или раскрылся без прокрутки — рамки надо передвинуть или убрать.
+    this.doc.addEventListener('transitionend', this.onChange, { capture: true, passive: true });
+    this.doc.addEventListener('animationend', this.onChange, { capture: true, passive: true });
   }
 
   private schedule(): void {
@@ -92,12 +97,13 @@ export class DebugOverlay {
     const vh = win?.innerHeight ?? 0;
     const frag = this.doc.createDocumentFragment();
     for (const item of this.items) {
-      let r: Rect;
+      let r: Rect | null;
       try {
         r = item.rect();
       } catch {
         continue; // элемент удалён из DOM
       }
+      if (!r) continue;
       if (r.width <= 0 || r.height <= 0 || r.y + r.height < 0 || r.y > vh || r.x + r.width < 0 || r.x > vw) continue;
       const hue = (item.index * 47) % 360;
       const box = this.doc.createElement('div');
