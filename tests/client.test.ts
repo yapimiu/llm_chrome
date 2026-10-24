@@ -121,3 +121,14 @@ describe('chatStream', () => {
     await expect(chatStream({ profile: profile(), messages: msgs, fetchImpl, signal: ctrl.signal })).rejects.toThrow();
   });
 });
+
+it('does not fall back for an unrelated invalid JSON request body', async () => {
+  const body = 'invalid JSON request body';
+  const originalAutoFormats = ['json_schema', 'json_object', 'none'];
+  const originalAttempts = originalAutoFormats.filter(() => /response_format|json_schema|schema|grammar|json/i.test(body)).length;
+  expect(originalAttempts).toBe(3);
+  const fetchImpl = vi.fn(async () => new Response('invalid JSON request body', { status: 400 })) as unknown as FetchFn;
+  await expect(chatStream({ profile: profile(), messages: msgs, schema, fetchImpl })).rejects.toBeInstanceOf(HttpError);
+  expect(fetchImpl).toHaveBeenCalledTimes(1);
+  console.info('unrelated request JSON rejection transport fixture', { originalAttempts, afterAttempts: 1, successfulTasks: 0 });
+});

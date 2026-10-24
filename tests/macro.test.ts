@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { AgentAction } from '@/lib/agent/actions';
 import { elementKey, findElement, handoffTask, macroFromRun, nthOf, observationLines, Replayer, type Macro, type ReplayObservation } from '@/lib/agent/macro';
-import type { RiskReason } from '@/lib/agent/risk';
+import { assessAction, DEFAULT_RISK_RULES, type RiskReason } from '@/lib/agent/risk';
 import type { ElementBrief, RunState, StepRecord } from '@/lib/agent/types';
 
 const brief = (index: number, line: string): ElementBrief => ({ index, line, y: index * 10, disabled: false, next: false, clickable: true });
@@ -123,4 +123,25 @@ describe('Replayer', () => {
     expect(st.message).toMatch(/нет элемента/);
     expect(handoffTask(macro, st)).toMatch(/дошёл до шага 1 из 2/);
   });
+});
+
+
+it('replays safe steps with fresh indices, handles and real risk assessment without model requests', async () => {
+  const fetchSpy = vi.spyOn(globalThis, 'fetch');
+  const macro: Macro = { id: 'safe', name: 'safe', task: 'next', createdAt: 0, startUrl: 'https://example.test/', steps: [1, 2, 3].map((index) => ({ action: { action: 'click' as const, index }, target: 'button "Continue"', url: '' })) };
+  let count = 0;
+  const trace: string[] = [];
+  const replay = new Replayer(macro, {
+    observe: async () => { count++; trace.push(`observe:${count}`); return { url: 'https://example.test/', elements: [brief(count * 10, 'button "Continue"')], handle: { frames: [{ frameId: 0, snapshotId: count }], owner: { [count * 10]: 0 }, nodes: [] } }; },
+    assess: (action, target, toTarget, obs) => {
+      trace.push(`assess:${obs.handle.frames[0]!.snapshotId}:${'index' in action ? action.index : 0}`);
+      return assessAction({ action, target, toTarget, url: obs.url, flags: [], modelFlag: false, rules: DEFAULT_RISK_RULES, policy: { mode: 'ask', safe: [] } });
+    },
+    execute: async (action, handle) => { trace.push(`execute:${handle.frames[0]!.snapshotId}:${'index' in action ? action.index : 0}`); return { ok: true, message: 'ok' }; },
+    confirm: async () => { throw new Error('safe replay should not need confirmation'); },
+    ask: async () => null, sleep: async () => {}, onState: () => {},
+  }, { findAttempts: 1, findDelayMs: 0, settleMs: 0 });
+  expect((await replay.run()).status).toBe('done');
+  expect(trace).toEqual(['observe:1', 'assess:1:10', 'execute:1:10', 'observe:2', 'assess:2:20', 'execute:2:20', 'observe:3', 'assess:3:30', 'execute:3:30']);
+  expect(fetchSpy).not.toHaveBeenCalled();
 });

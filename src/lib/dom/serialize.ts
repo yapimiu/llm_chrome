@@ -129,7 +129,7 @@ export function serializePage(s: PageSnapshot, opts: SerializeOptions): Serializ
   let used = 0;
   for (const e of byPriority(s.elements)) {
     const line = serializeElement(e, maxText);
-    if (used + line.length + 1 > elementBudget) break;
+    if (used + line.length + 1 > elementBudget) continue;
     lines.set(e.index, line);
     used += line.length + 1;
   }

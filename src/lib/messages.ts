@@ -1,3 +1,4 @@
+import type { exportUsage } from './llm/usage';
 import { browser } from '#imports';
 import type { CourseState } from './agent/course';
 import type { Macro, ReplayState } from './agent/macro';
@@ -105,6 +106,7 @@ export type BackgroundRequest =
   | { type: 'bg:run-detail'; runId: string; n: number }
   | { type: 'bg:runs-list' }
   | { type: 'bg:run-export'; runId: string }
+  | { type: 'bg:run-usage-export'; runId: string }
   /** Прерванный перезапуском запуск: продолжить или забыть. */
   | { type: 'bg:run-recover'; command: 'resume' | 'discard' }
   | { type: 'bg:queue-list' }
@@ -185,6 +187,7 @@ export interface BackgroundResponses {
   'bg:run-detail': StepDetail | null;
   'bg:runs-list': RunSummary[];
   'bg:run-export': unknown;
+  'bg:run-usage-export': ReturnType<typeof exportUsage> | null;
   'bg:run-recover': null;
   'bg:queue-list': DeferredItem[];
   'bg:queue-resume': RunState;

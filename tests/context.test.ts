@@ -187,9 +187,10 @@ describe('buildDigest', () => {
     expect(buildDigest([], [])).toBe('');
   });
 
-  it('не длиннее лимита истории, даже с огромными заметками extract', () => {
+  it('сохраняет огромный extract полностью с явным soft overflow', () => {
     const out = buildDigest([step(1, 'https://a.example/')], ['x'.repeat(20000)]);
-    expect(out.length).toBeLessThanOrEqual(4000);
-    expect(out).toContain('Step 1:');
+    expect(out).toContain('x'.repeat(20000));
+    expect(out).toContain('soft budget exceeded');
+    expect(out.length).toBeGreaterThan(20000);
   });
 });

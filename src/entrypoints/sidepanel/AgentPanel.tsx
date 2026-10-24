@@ -1,3 +1,4 @@
+import { formatRunUsage } from '@/lib/llm/usage';
 import { useEffect, useState } from 'preact/hooks';
 import { browser } from '#imports';
 import { TERMINAL_STATUSES, type RunState, type RunStatus } from '@/lib/agent/types';
@@ -103,6 +104,7 @@ export function AgentPanel({ task, settings }: { task: string; settings: Setting
         <div class="card approval">
           <b>Задача прервана перезапуском браузера или расширения</b>
           <div class="muted runlog-task">{run.task}</div>
+          <details><summary>Расход LLM</summary><div class="muted stats">{formatRunUsage(run)}</div></details>
           <p class="muted">
             Выполнено шагов: {run.steps.length}. Агент продолжит с текущей страницы и проверит, что успело выполниться.
           </p>
@@ -161,6 +163,7 @@ export function AgentPanel({ task, settings }: { task: string; settings: Setting
             {run.restarts ? ` · перезапусков: ${run.restarts}` : ''}
           </div>
           <div class="muted runlog-task">{run.task}</div>
+          <details><summary>Расход LLM</summary><div class="muted stats">{formatRunUsage(run)}</div></details>
         </div>
       )}
 

@@ -11,7 +11,7 @@ function isClickable(e: ElementInfo): boolean {
   if (e.tag === 'input') return !NOT_CLICKABLE_TYPES.has(e.type ?? '');
   return true;
 }
-import { buildFrameTree, mergeObservations, type FrameInfoReport, type FrameNode, type FrameTagReport, type RawFrameObservation } from './frames';
+import { buildFrameTree, completeSingleFrame, mergeObservations, type FrameInfoReport, type FrameNode, type FrameTagReport, type RawFrameObservation } from './frames';
 import type { ContentRequest, ContentResponses, ObserveResult, Result } from './messages';
 
 /** Страницы, куда Chrome не пускает расширения. */
@@ -84,9 +84,11 @@ async function injectAllFrames(tabId: number, url?: string): Promise<number[]> {
 
 export interface PageObservation extends ObserveResult {
   handle: ObservationHandle;
+  complete?: boolean;
 }
 
 export interface ObserveOptions {
+  maxTextPerElement?: number;
   maxChars: number;
   highlight: boolean;
   /** Тексты «скрыть от модели» (нижний регистр). */
@@ -105,13 +107,13 @@ export async function observePage(tabId: number, url: string | undefined, opts: 
   const ask = <R extends ContentRequest>(req: R, frameId: number) => sendToContent(tabId, req, frameId);
 
   // 1. Каждый фрейм метит свои iframe с других сайтов и сообщает их положение.
-  const tags: FrameTagReport[] = await Promise.all(
+  const tags = (await Promise.all(
     frameIds.map((frameId) =>
       ask({ type: 'content:frame-tag' }, frameId)
         .then((children) => ({ frameId, children }))
-        .catch(() => ({ frameId, children: [] })),
+        .catch(() => null),
     ),
-  );
+  )).filter((tag): tag is FrameTagReport => tag !== null);
   await new Promise((r) => setTimeout(r, FRAME_TAG_DELAY_MS));
   // 2. Каждый фрейм сообщает полученную метку — так frameId сопоставляется с iframe-элементом.
   const infos = (
@@ -145,7 +147,7 @@ export async function observePage(tabId: number, url: string | undefined, opts: 
   }
 
   const snapshot = mergeObservations(parts);
-  const page = serializePage(snapshot, { maxChars: opts.maxChars });
+  const page = serializePage(snapshot, { maxChars: opts.maxChars, maxTextPerElement: opts.maxTextPerElement });
   await Promise.all(
     parts.map(({ node, obs }) =>
       ask({ type: 'content:show', snapshotId: obs.snapshotId, shown: page.shownIndices, highlight: opts.highlight }, node.frameId).catch(() => {}),
@@ -175,6 +177,7 @@ export async function observePage(tabId: number, url: string | undefined, opts: 
 
   return {
     text: page.text,
+    complete: completeSingleFrame(frameIds, tags, infos, parts, page),
     stats: {
       url: snapshot.url,
       totalElements: snapshot.elements.length,

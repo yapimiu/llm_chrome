@@ -829,3 +829,23 @@ describe('пройденный тест: заблокированные вари
   });
 });
 
+
+describe('collection text completeness metadata', () => {
+  it('reports a complete short collection without changing content or indices', () => {
+    const { snapshot } = collect('<p>short text</p><button data-rect="0 50 100 20">Continue</button>', { maxTextChars: 1000 });
+    expect(snapshot.stats.textTruncated).toBe(false);
+    expect(snapshot.text).toContain('short text');
+    expect(snapshot.elements.map((e) => e.index)).toEqual([1]);
+  });
+  it('reports skipped blocks even when rendered text is shorter than the cap', () => {
+    const { snapshot } = collect('<p>abc</p><p>def</p>', { maxTextChars: 4 });
+    expect(snapshot.text).toBe('abc');
+    expect(snapshot.text.length).toBeLessThan(4);
+    expect(snapshot.stats.textTruncated).toBe(true);
+  });
+  it('reports final render slicing with just one oversized text block', () => {
+    const { snapshot } = collect('<p>abcdefghij</p>', { maxTextChars: 4 });
+    expect(snapshot.text).toBe('abcd');
+    expect(snapshot.stats.textTruncated).toBe(true);
+  });
+});

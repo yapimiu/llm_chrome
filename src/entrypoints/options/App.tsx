@@ -335,6 +335,14 @@ export function App() {
               <option value="always">на каждом шаге</option>
             </select>
           </label>
+          <label>Объём наблюдения
+            <select value={settings.agent.observationMode ?? 'standard'} onChange={(e) => setAgent('observationMode', e.currentTarget.value as AgentSettings['observationMode'])}>
+              <option value="minimal">Минимальный</option>
+              <option value="standard">Стандартный</option>
+              <option value="detailed">Подробный</option>
+              <option value="adaptive">Адаптивный (экспериментальный)</option>
+            </select>
+          </label>
           <NumberField
             label="Лимит наблюдения, символов"
             value={settings.agent.maxObservationChars}

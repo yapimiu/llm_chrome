@@ -69,6 +69,8 @@ export interface ScrollInfo {
 }
 
 export interface CollectStats {
+  /** Undefined in old observations: completeness is unknown. */
+  textTruncated?: boolean;
   /** Сколько элементов DOM обошли. */
   nodesVisited: number;
   /** Обход прерван по лимиту узлов. */

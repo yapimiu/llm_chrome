@@ -1,3 +1,4 @@
+import type { StepUsage } from '../llm/usage';
 import type { EscalationState } from './escalation';
 import type { ElementFlag } from '../dom/types';
 import type { FrameNode } from '../frames';
@@ -98,6 +99,7 @@ export interface StepRecord {
   expectedOutcome: string;
   actions: ExecutedAction[];
   llm?: StepLlmInfo;
+  usage?: StepUsage;
   /** Предупреждения парсера, детектора зацикливания, бюджета контекста. */
   warnings: string[];
   /** Ответ пользователя, отказ в одобрении и т.п. — попадает в историю для модели. */

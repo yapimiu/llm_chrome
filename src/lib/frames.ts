@@ -86,9 +86,10 @@ function hostOf(url: string): string {
 /** Склеивает наблюдения фреймов в один снимок страницы; номера уже глобальные (indexBase). */
 export function mergeObservations(parts: readonly { node: FrameNode; obs: RawFrameObservation }[]): PageSnapshot {
   const top = parts.find((p) => p.node.frameId === 0)?.obs ?? parts[0]!.obs;
-  const stats: CollectStats = { nodesVisited: 0, walkTruncated: false, covered: 0, offscreen: 0, hidden: 0, userHidden: 0 };
+  const stats: CollectStats = { textTruncated: false, nodesVisited: 0, walkTruncated: false, covered: 0, offscreen: 0, hidden: 0, userHidden: 0 };
   const texts: string[] = [];
   for (const { node, obs } of parts) {
+    if (obs.stats.textTruncated !== false) stats.textTruncated = true;
     stats.nodesVisited += obs.stats.nodesVisited;
     stats.walkTruncated ||= obs.stats.walkTruncated;
     stats.covered += obs.stats.covered;
@@ -106,4 +107,22 @@ export function mergeObservations(parts: readonly { node: FrameNode; obs: RawFra
     text: texts.join('\n'),
     stats,
   };
+}
+
+/** Conservative: multi-frame or incomplete metadata never enables reduced observations. */
+export function completeSingleFrame(frameIds: readonly number[], tags: readonly FrameTagReport[], infos: readonly FrameInfoReport[], parts: readonly { node: FrameNode; obs: RawFrameObservation }[], page: { textTruncated: boolean; omittedElements: number }): boolean {
+  const part = parts[0];
+  return frameIds.length === 1 &&
+    frameIds[0] === 0 &&
+    tags.length === 1 &&
+    tags[0]?.frameId === 0 &&
+    tags[0]?.children.length === 0 &&
+    infos.length === 1 &&
+    infos[0]?.frameId === 0 &&
+    parts.length === 1 &&
+    part?.node.frameId === 0 &&
+    part.obs.stats.textTruncated === false &&
+    part.obs.stats.walkTruncated === false &&
+    !page.textTruncated &&
+    page.omittedElements === 0;
 }

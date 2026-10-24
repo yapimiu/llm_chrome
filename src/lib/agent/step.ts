@@ -1,6 +1,6 @@
 import type { ChatDelta, ChatMessage, ChatResult, StructuredFormat } from '../llm/client';
 import { agentResponseSchema, type AgentStep } from './actions';
-import { parseAgentStep } from './parse';
+import { parseAgentStep, stripThinking } from './parse';
 import { charsForTokens, isContextOverflow } from './context';
 import { buildStepMessages, correctionMessage, estimateTokens, type TabInfo } from './prompt';
 
@@ -140,8 +140,10 @@ export async function runStep(input: StepInput, deps: StepDeps, onEvent: (e: Ste
     );
   }
 
+  let baseMessages = messages;
   let overflowRetried = false;
   for (let attempt = 1; attempt <= input.maxRetries + 1; attempt++) {
+    sync();
     onEvent({ phase: 'llm', attempt });
     const sentEstimate = estimateTokens(messages);
     let res: ChatResult;
@@ -157,6 +159,7 @@ export async function runStep(input: StepInput, deps: StepDeps, onEvent: (e: Ste
       if (!isContextOverflow(err) || overflowRetried) throw err;
       overflowRetried = true;
       if (!(await reset(Math.floor(input.contextTokens * 0.6)))) throw err;
+      baseMessages = messages;
       outcome.resets.push('the server rejected the request as too large — retrying with a reset context');
       attempt--;
       continue;
@@ -183,7 +186,9 @@ export async function runStep(input: StepInput, deps: StepDeps, onEvent: (e: Ste
 
     record.parseError = parsed.error;
     onEvent({ phase: 'parse-error', attempt, error: parsed.error });
-    messages.push({ role: 'assistant', content: res.content || '(empty)' }, correctionMessage(parsed.error, res.finishReason === 'length'));
+    if (attempt <= input.maxRetries) {
+      messages = [...baseMessages, { role: 'assistant', content: stripThinking(res.content).slice(0, 512) || '(empty)' }, correctionMessage(parsed.error.slice(0, 256), res.finishReason === 'length')];
+    }
   }
 
   outcome.error = `Модель не дала корректный ответ за ${input.maxRetries + 1} попыток: ${outcome.attempts.at(-1)?.parseError ?? ''}`;

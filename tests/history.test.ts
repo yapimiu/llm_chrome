@@ -32,7 +32,8 @@ describe('buildHistory', () => {
     expect(h).toContain('Step 1: click [1] → clicked');
     expect(h).toContain('Step 3: click [3] → clicked');
     expect(h).not.toContain('Причина шага 3');
-    expect(h).toContain('Step 5 (https://example.com/page5):\n  reasoning: Причина шага 5\n  expected: Ожидание 5\n  - click [5] (button "Кнопка 5") → clicked');
+    expect(h).toContain('Step 5 (https://example.com/page5):\n  - click [5] (button "Кнопка 5") → clicked');
+    expect(h).not.toContain('Причина шага 5');
     expect(h.indexOf('Step 1:')).toBeLessThan(h.indexOf('Step 4 ('));
   });
 
@@ -61,7 +62,7 @@ describe('buildHistory', () => {
     const steps = Array.from({ length: 200 }, (_, i) => step(i + 1));
     const h = buildHistory(steps, ['заметка'], { detailed: 3, maxChars: 2000 });
     expect(h.length).toBeLessThanOrEqual(2000);
-    expect(h).toMatch(/\(\d+ earlier steps omitted\)/);
+    expect(h).toMatch(/earlier steps omitted/);
     expect(h).toContain('Step 200 (');
     expect(h).toContain('заметка');
     expect(h).not.toContain('Step 1:');
@@ -110,4 +111,51 @@ describe('pageSignature и actionSignature', () => {
     expect(a).not.toBe(c);
     expect(actionSignature([{ action: { action: 'scroll', direction: 'down', amount: 1 } }])).toContain('scroll');
   });
+});
+
+describe('protected history floor', () => {
+  it('retains old safety directives, replies, failures and LOOP after many healthy steps', () => {
+    const records = Array.from({ length: 80 }, (_, i) => step(i + 1));
+    records[0] = step(1, { notes: ['BLOCKED: do not submit', 'POSTPONED: confirm payment', 'User answered: keep account', 'The user rejected action: delete'], error: 'old distinct failure', warnings: ['LOOP: old warning'] });
+    const h = buildHistory(records, ['saved fact'], { detailed: 3, maxChars: 800 });
+    for (const marker of ['BLOCKED: do not submit', 'POSTPONED: confirm payment', 'User answered: keep account', 'The user rejected action: delete', 'old distinct failure', 'LOOP: old warning', 'saved fact']) expect(h).toContain(marker);
+    expect(h).toContain('Step 1:');
+    expect(h).toContain('use current observation indices');
+    expect(h.length).toBeLessThanOrEqual(800);
+  });
+  it('keeps protected facts and complete failure text even when they exceed the budget', () => {
+    const fact = 'fact '.repeat(300);
+    const failure = 'failure detail '.repeat(100);
+    const h = buildHistory([step(1, { actions: [{ action: { action: 'click', index: 1 }, result: { ok: false, message: failure } }] })], [fact], { detailed: 1, maxChars: 100 });
+    expect(h).toContain(fact);
+    expect(h).toContain(failure);
+    expect(h).toContain('soft budget exceeded');
+    expect(h.length).toBeGreaterThan(100);
+  });
+  it('deduplicates exact protected notes and facts without duplication in detailed steps', () => {
+    const records = [step(1, { notes: ['BLOCKED: keep this full'] }), step(2, { notes: ['BLOCKED: keep this full'] })];
+    const h = buildHistory(records, ['same fact', 'same fact']);
+    expect(h.split('BLOCKED: keep this full')).toHaveLength(2);
+    expect(h.split('same fact')).toHaveLength(2);
+    expect(h).toContain('Step 1: note: BLOCKED');
+  });
+  it('bounds ordinary notes and keeps the six latest distinct complete failures', () => {
+    const records = Array.from({ length: 20 }, (_, i) => step(i + 1, { error: `failure-${i + 1}-END`, notes: [`ordinary-${i}:` + 'x'.repeat(1000)] }));
+    const h = buildHistory(records, [], { detailed: 3, maxChars: 500 });
+    expect(h).toContain('failure-20-END');
+    expect(h).not.toContain('failure-1-END');
+    expect(h).not.toContain('ordinary-0:');
+    expect(h.length).toBeLessThan(3000);
+  });
+});
+
+
+it('protects no-effect results and full targets even when result.ok is true', () => {
+  const message = 'detail '.repeat(30) + 'nothing on the page changed';
+  const target = 'target '.repeat(30);
+  const records = [step(1, { actions: [{ action: { action: 'click', index: 1 }, target, result: { ok: true, message } }] }), ...Array.from({ length: 30 }, (_, i) => step(i + 2))];
+  const h = buildHistory(records, [], { detailed: 3, maxChars: 300 });
+  expect(h).toContain(message);
+  expect(h).toContain(target);
+  expect(h).toContain('Step 1:');
 });

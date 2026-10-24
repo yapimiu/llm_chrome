@@ -1,3 +1,4 @@
+import { OBSERVATION_MODES, type ObservationMode } from './agent/observation-mode';
 import { storage } from '#imports';
 import { DEFAULT_RISK_RULES, type RiskRules, type SiteRiskMode } from './agent/risk';
 import type { SiteNote } from './agent/site-notes';
@@ -59,6 +60,7 @@ export interface AgentSettings {
   autoReadMaxMin: number;
   /** Жёсткий лимит символов на наблюдение (сериализованную страницу). */
   maxObservationChars: number;
+  observationMode?: ObservationMode;
   /** Пошаговый режим: перед выполнением действий агент ждёт «Выполнить» от человека. */
   approveEachStep: boolean;
   /** Автономный режим: рискованные действия откладываются в очередь «на утро». */
@@ -200,6 +202,7 @@ export const DEFAULT_SETTINGS: Settings & { profiles: Record<'fast' | 'slow' | '
     screenshots: 'stuck',
     approveEachStep: false,
     maxObservationChars: 12000,
+    observationMode: 'standard',
     autonomous: false,
     useDebugger: true,
     showCursor: true,
@@ -338,6 +341,7 @@ function sanitizeAgent(raw: unknown, def: AgentSettings): AgentSettings {
     autoRead: bool(r.autoRead, def.autoRead),
     autoReadMaxMin: num(r.autoReadMaxMin, def.autoReadMaxMin, 1, 120, true),
     maxObservationChars: num(r.maxObservationChars, def.maxObservationChars, 1000, 500_000, true),
+    observationMode: OBSERVATION_MODES.includes(r.observationMode as ObservationMode) ? (r.observationMode as ObservationMode) : 'standard',
     approveEachStep: bool(r.approveEachStep, def.approveEachStep),
     autonomous: bool(r.autonomous, def.autonomous),
     useDebugger: bool(r.useDebugger, def.useDebugger),

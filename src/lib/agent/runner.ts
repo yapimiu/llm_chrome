@@ -1,3 +1,5 @@
+import { observationMode, observationLimits, type ObservationMode, type PreviousObservation } from './observation-mode';
+import type { HttpAttempt } from '../llm/usage';
 import { advance, INITIAL_ESCALATION, isEscalationEnabled, judgeStep, type EscalationConfig, type ModelLevel } from './escalation';
 import type { ChatDelta, ChatMessage, ChatResult } from '../llm/client';
 import { describeError, isTransientError } from '../llm/client';
@@ -23,6 +25,8 @@ import {
 } from './types';
 
 export interface RunConfig {
+  observationMode?: ObservationMode;
+  maxObservationChars?: number;
   task: string;
   systemTemplate: string;
   boundary: string;
@@ -67,6 +71,7 @@ export function needsScreenshot(mode: ScreenshotMode | undefined, prev: StepReco
 }
 
 export interface Observation {
+  complete?: boolean;
   observation: string;
   /** Скриншот с номерами элементов (data:-адрес), если просили. */
   image?: string;
@@ -77,7 +82,7 @@ export interface Observation {
 }
 
 export interface RunDeps {
-  observe(opts?: { screenshot: boolean; maxChars?: number }): Promise<Observation>;
+  observe(opts?: { screenshot: boolean; maxChars?: number; maxTextPerElement?: number }): Promise<Observation>;
   chat(
     messages: ChatMessage[],
     schema: Record<string, unknown>,
@@ -86,6 +91,7 @@ export interface RunDeps {
     signal: AbortSignal,
     /** Профиль модели этой ступени (при автосмене); не задан — профиль запуска. */
     profileId?: string,
+    onAttempt?: (attempt: HttpAttempt) => void,
   ): Promise<ChatResult>;
   /** Действия, меняющие страницу/вкладку (кроме done/ask_user/extract — их ведёт сам цикл). */
   execute(action: AgentAction, handle: ObservationHandle, signal?: AbortSignal): Promise<ActionResult>;
@@ -402,6 +408,7 @@ export class AgentRunner {
 
   /** Поправка оценки токенов по реальному расходу сервера (см. updateTokenRatio). */
   private tokenRatio = 1;
+  private previousObservation?: PreviousObservation;
 
   /** Адреса, которые уже прочитаны в этом запуске (без #якоря): каждую страницу читаем один раз. */
   private readonly readPages = new Set<string>();
@@ -425,9 +432,12 @@ export class AgentRunner {
     const level = this.currentLevel();
     const n = this.state.steps.length + 1;
     const record: StepRecord = { n, startedAt: this.deps.now(), url: '', reasoning: '', expectedOutcome: '', actions: [], warnings: [], notes: [] };
+    record.usage = { attempts: [], parseRetries: 0, parseErrors: 0, chatCalls: 0, unmeasuredChatCalls: 0 };
     const history = buildHistory(this.state.steps, this.state.extracted);
     let obs: Observation | null = null;
     let outcome: StepOutcome;
+    let parseRetryPending = false;
+    const detail = observationMode(this.cfg.observationMode, this.state.steps.at(-1), this.previousObservation, !!this.switchNote);
 
     try {
       outcome = await runStep(
@@ -449,17 +459,41 @@ export class AgentRunner {
           observe: async (o) => {
             // Картинки — только если модель текущей ступени их понимает.
             const shot = (level?.vision ?? true) && needsScreenshot(this.cfg.screenshots, this.state.steps.at(-1));
-            obs = await this.deps.observe({ screenshot: shot, maxChars: o?.maxChars });
+            const limits = observationLimits(detail, Math.min(this.cfg.maxObservationChars ?? Infinity, o?.maxChars ?? Infinity));
+            const fresh = async () => {
+              let current = await this.deps.observe({ screenshot: shot, ...limits, maxChars: detail === 'standard' && this.cfg.maxObservationChars === undefined ? o?.maxChars : limits.maxChars });
+              if (this.cfg.observationMode === 'adaptive' && detail === 'minimal' && (current.complete !== true || current.url !== this.previousObservation?.url)) {
+                current = await this.deps.observe({ screenshot: shot, ...observationLimits('standard', Math.min(this.cfg.maxObservationChars ?? Infinity, o?.maxChars ?? Infinity)) });
+              }
+              return current;
+            };
+            obs = await fresh();
             // Новая страница: сначала «читаем» её, потом смотрим на неё заново — модель увидит, где мы оказались.
-            if (await this.autoRead(obs, record)) obs = await this.deps.observe({ screenshot: shot, maxChars: o?.maxChars });
+            if (await this.autoRead(obs, record)) obs = await fresh();
             return { observation: obs.observation, tabs: obs.tabs, url: obs.url, image: obs.image };
           },
-          chat: (messages, schema, onDelta, onRetry) => this.deps.chat(messages, schema, onDelta, onRetry, this.abort.signal, level?.id),
+          chat: (messages, schema, onDelta, onRetry) => {
+            const usage = record.usage!;
+            usage.chatCalls!++;
+            usage.unmeasuredChatCalls!++;
+            let measured = false;
+            return this.deps.chat(messages, schema, onDelta, onRetry, this.abort.signal, level?.id, (a) => {
+              if (!measured) { measured = true; usage.unmeasuredChatCalls!--; }
+              usage.attempts.push(a);
+            });
+          },
         },
-        (e) => this.deps.onProgress(e),
+        (e) => {
+          if (e.phase === 'parse-error') { parseRetryPending = true; record.usage!.parseErrors!++; }
+          if (e.phase === 'llm' && parseRetryPending) { record.usage!.parseRetries++; parseRetryPending = false; }
+          this.deps.onProgress(e);
+        },
       );
     } catch (err) {
-      if (this.stopped) throw new StoppedError();
+      if (this.stopped) {
+        await this.saveStep(record, obs, history, null);
+        throw new StoppedError();
+      }
       record.error = describeError(err);
       record.url = (obs as Observation | null)?.url ?? '';
       await this.saveStep(record, obs, history, null);
@@ -468,6 +502,7 @@ export class AgentRunner {
 
     const seen = obs as unknown as Observation;
     record.url = seen.url;
+    this.previousObservation = { url: seen.url, chars: seen.observation.length, complete: seen.complete === true };
     if (this.switchNote) record.notes.push(this.switchNote);
     this.switchNote = null;
     record.warnings.push(...outcome.warnings);

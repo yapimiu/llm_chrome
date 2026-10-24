@@ -218,3 +218,25 @@ describe('serializePage', () => {
     expect(titleLine!.length).toBeLessThanOrEqual('Title: '.length + 150);
   });
 });
+
+
+describe('oversized element retention', () => {
+  it('skips an oversized middle line and retains later short elements in document order', () => {
+    const huge = el({ index: 2, name: 'Long', attrs: Array.from({ length: 20 }, (_, i) => [`data-${i}`, 'x'.repeat(80)]) });
+    const page = snap({ elements: [el({ index: 1, name: 'First' }), huge, el({ index: 3, name: 'Continue' })] });
+    const result = serializePage(page, { maxChars: 600 });
+    expect(result.shownIndices).toEqual([1, 3]);
+    expect(result.omittedElements).toBe(1);
+    expect(result.text.length).toBeLessThanOrEqual(600);
+    expect(result.text.indexOf('[1]')).toBeLessThan(result.text.indexOf('[3]'));
+  });
+  it('does not expose phantom indices when a tiny budget fits no element', () => {
+    const page = snap({ elements: [el({ index: 1, name: 'Continue' })] });
+    for (const maxChars of [0, 1, 20, 100]) {
+      const result = serializePage(page, { maxChars });
+      expect(result.shownIndices).toEqual([]);
+      expect(result.omittedElements).toBe(1);
+      expect(result.text.length).toBeLessThanOrEqual(maxChars);
+    }
+  });
+});

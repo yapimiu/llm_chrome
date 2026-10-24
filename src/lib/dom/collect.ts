@@ -587,7 +587,7 @@ export function collectSnapshot(doc: Document, geom: Geometry, opts: CollectOpti
   const semantic: boolean[] = [];
   const tabindexOnly: boolean[] = [];
   let scroller: { el: Element; area: number } | null = null;
-  const stats: CollectStats = { nodesVisited: 0, walkTruncated: false, covered: 0, offscreen: 0, hidden: 0, userHidden: 0 };
+  const stats: CollectStats = { textTruncated: false, nodesVisited: 0, walkTruncated: false, covered: 0, offscreen: 0, hidden: 0, userHidden: 0 };
   const hideRules = parseHideRules(opts.hideNames ?? []);
   const nextRules = parseHideRules(opts.nextNames ?? []);
   const hiding = hasRules(hideRules);
@@ -778,7 +778,7 @@ export function collectSnapshot(doc: Document, geom: Geometry, opts: CollectOpti
 
   /** selfRef — блок сам интерактивен (карточка): строка начнётся с его номера. */
   const addBlockText = (el: Element, cursor: string, ctx: WalkCtx, selfRef: boolean): void => {
-    if (textLen >= maxTextChars) return;
+    if (textLen >= maxTextChars) { stats.textTruncated = true; return; }
     const flow = inlineFlow(el, cursor);
     if (!flow.plain) return;
     const preview = collapseWhitespace(flow.segs.filter((s): s is string => typeof s === 'string').join(''));
@@ -882,6 +882,7 @@ export function collectSnapshot(doc: Document, geom: Geometry, opts: CollectOpti
     if (detected?.editor) {
       // Код редактора — в текст построчно, без номеров строк и стрелок сворачивания.
       const lines = codeEditorLines(el) ?? [];
+      if (lines.length && textLen >= maxTextChars) stats.textTruncated = true;
       if (lines.length && textLen < maxTextChars) {
         textLines.push([el, ' code editor contents:']);
         for (const line of lines) textLines.push([line.trimEnd() || ' ']);
@@ -987,6 +988,8 @@ export function collectSnapshot(doc: Document, geom: Geometry, opts: CollectOpti
   const found = scroller as { el: Element; area: number } | null;
   const main = !windowScrolls && found && found.area >= vp.width * vp.height * MIN_SCROLLER_AREA ? found.el : null;
   const mainBox = main ? geom.scrollBox(main) : null;
+  const renderedText = renderText(textLines, registry, lockedNotes);
+  if (renderedText.length > maxTextChars) stats.textTruncated = true;
 
   return {
     snapshot: {
@@ -1009,7 +1012,7 @@ export function collectSnapshot(doc: Document, geom: Geometry, opts: CollectOpti
             viewportHeight: vp.height,
           },
       elements,
-      text: renderText(textLines, registry, lockedNotes).slice(0, maxTextChars),
+      text: renderedText.slice(0, maxTextChars),
       stats,
     },
     registry,

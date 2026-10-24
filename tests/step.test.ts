@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { runStep, type StepDeps, type StepEvent, type StepInput } from '@/lib/agent/step';
+import { estimateTokens } from '@/lib/agent/prompt';
 import type { ChatMessage, ChatResult } from '@/lib/llm/client';
 
 const input: StepInput = {
@@ -77,5 +78,47 @@ describe('runStep', () => {
     const d = deps([reply('{"actions":[{"action":"done","result":"ok"},{"action":"click","index":1}]}')]);
     const out = await runStep(input, d);
     expect(out.warnings.join()).toMatch(/dropped 1 action/);
+  });
+});
+
+describe('bounded parse retry payloads', () => {
+  it('sends the base plus only the last invalid excerpt; estimates match actual payload', async () => {
+    const d = deps([reply('FIRST '.repeat(4000)), reply('SECOND '.repeat(4000)), reply('{"actions":[{"action":"done","result":"ok"}]}')]);
+    const out = await runStep(input, d);
+    const base = d.calls[0]!;
+    expect(d.calls[1]!.slice(0, base.length)).toEqual(base);
+    expect(d.calls[2]!.slice(0, base.length)).toEqual(base);
+    expect(d.calls[1]).toHaveLength(base.length + 2);
+    expect(d.calls[2]).toHaveLength(base.length + 2);
+    expect(d.calls[2]!.at(-2)!.content).toBe('SECOND '.repeat(4000).slice(0, 512));
+    expect(JSON.stringify(d.calls[2])).not.toContain('FIRST');
+    expect(out.messages).toEqual(d.calls[2]);
+    out.attempts.forEach((attempt, i) => expect(attempt.promptTokensEstimate).toBe(estimateTokens(d.calls[i]!)));
+    expect(out.promptTokensEstimate).toBe(estimateTokens(out.messages));
+    expect(d.observe).toHaveBeenCalledTimes(1);
+  });
+  it.each(['', '<think>reasoning only', '<think>hidden</think>not JSON'])('handles empty/thinking reply %s and length guidance', async (content) => {
+    const d = deps([reply(content, 'length'), reply('{"actions":[{"action":"go_back"}]}')]);
+    await runStep(input, d);
+    expect(d.calls[1]!.at(-2)!.content).toBe(content.endsWith('not JSON') ? 'not JSON' : '(empty)');
+    expect(d.calls[1]!.at(-1)!.content).toContain('cut off by the token limit');
+    expect(JSON.stringify(d.calls[1])).not.toContain('hidden');
+  });
+  it('bounds parser error excerpts and does not add an unsent correction after exhaustion', async () => {
+    const invalid = JSON.stringify({ actions: [{ action: 'click', index: 'invalid'.repeat(2000) }] });
+    const d = deps([reply(invalid), reply(invalid), reply(invalid)]);
+    const out = await runStep(input, d);
+    expect(out.error).toBeDefined();
+    expect(out.messages).toEqual(d.calls.at(-1));
+    expect(d.calls).toHaveLength(3);
+    expect(String(d.calls[2]!.at(-1)!.content).length).toBeLessThan(600);
+  });
+  it('retains one base image per payload and local JSON repair avoids a retry', async () => {
+    const d = deps([reply('bad'), reply('{“actions”:[{“action”:“go_back”},],}')]);
+    d.observe = async () => ({ observation: '[1] button "Continue"', tabs: [], image: 'data:image/png;base64,fixture' });
+    const out = await runStep(input, d);
+    expect(out.step?.actions).toEqual([{ action: 'go_back' }]);
+    expect(d.calls).toHaveLength(2);
+    for (const call of d.calls) expect(call.reduce((n, m) => n + (Array.isArray(m.content) ? m.content.filter((p) => p.type === 'image_url').length : 0), 0)).toBe(1);
   });
 });

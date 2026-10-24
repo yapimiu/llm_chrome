@@ -1,3 +1,4 @@
+import { exportUsage } from '@/lib/llm/usage';
 import { browser, defineBackground } from '#imports';
 import systemTemplate from '@/prompts/system.md?raw';
 import { newBoundary, type TabInfo } from '@/lib/agent/prompt';
@@ -87,7 +88,7 @@ function throttledProgress(): (e: StepEvent) => void {
   };
 }
 
-async function observeAgentTab(tab: AgentTab, maxChars: number, highlight: boolean, siteNotes: SiteNote[], screenshot = false): Promise<Observation> {
+async function observeAgentTab(tab: AgentTab, maxChars: number, highlight: boolean, siteNotes: SiteNote[], screenshot = false, maxTextPerElement?: number): Promise<Observation> {
   const t = await browser.tabs.get(tab.tabId).catch(() => null);
   if (!t) throw new Error('Вкладка, в которой работал агент, закрыта.');
   const tabs: TabInfo[] = (await browser.tabs.query({ windowId: tab.windowId }))
@@ -104,13 +105,13 @@ async function observeAgentTab(tab: AgentTab, maxChars: number, highlight: boole
     };
   }
   // Для скриншота рамки с номерами нужны на экране — модель сопоставит картинку с номерами из текста.
-  const obs = await observePage(tab.tabId, url, { maxChars, highlight: highlight || screenshot, hide: hiddenNamesFor(url, siteNotes), next: nextRulesFor(url, siteNotes) });
+  const obs = await observePage(tab.tabId, url, { maxChars, maxTextPerElement, highlight: highlight || screenshot, hide: hiddenNamesFor(url, siteNotes), next: nextRulesFor(url, siteNotes) });
   let image: string | undefined;
   if (screenshot) {
     image = (await captureTab(tab.tabId)) ?? undefined;
     if (!highlight) await setHighlight(tab.tabId, url, false).catch(() => {});
   }
-  return { observation: obs.text, image, tabs, handle: obs.handle, url };
+  return { observation: obs.text, image, tabs, handle: obs.handle, url, complete: obs.complete };
 }
 
 // ——— Telegram ———
@@ -209,6 +210,8 @@ function runConfig(settings: Settings, task: string, overrides: Partial<RunConfi
     approvalWindowSec: settings.safety.approvalWindowSec,
     // Картинки — по профилю каждой ступени (см. escalation.levels[].vision).
     screenshots: settings.agent.screenshots,
+    observationMode: settings.agent.observationMode,
+    maxObservationChars: settings.agent.maxObservationChars,
     escalation: escalationConfig(settings),
     // Чтение длится минутами по замыслу; потолок — лимит чтения плюс запас на зависший браузер.
     readTimeoutSec: settings.agent.autoReadMaxMin * 60 + 120,
@@ -251,10 +254,10 @@ async function launch(settings: Settings, profileId: ProfileId, cfg: RunConfig, 
     cfg,
     {
       observe: (opts) =>
-        observeAgentTab(tab, Math.min(settings.agent.maxObservationChars, opts?.maxChars ?? Infinity), settings.agent.debugOverlay, cfg.siteNotes, opts?.screenshot ?? false),
+        observeAgentTab(tab, Math.min(settings.agent.maxObservationChars, opts?.maxChars ?? Infinity), settings.agent.debugOverlay, cfg.siteNotes, opts?.screenshot ?? false, opts?.maxTextPerElement),
       // Профиль ступени цепочки (автосмена моделей) или профиль запуска.
-      chat: (messages, schema, onDelta, onRetry, signal, levelId) =>
-        chatStream({ profile: levelId ? profileOf(settings, levelId) : profile, messages, schema, onDelta, onRetry, signal }),
+      chat: (messages, schema, onDelta, onRetry, signal, levelId, onAttempt) =>
+        chatStream({ profile: levelId ? profileOf(settings, levelId) : profile, messages, schema, onDelta, onRetry, signal, onAttempt }),
       execute: (action, handle, signal) => executeAction(action, handle, exec, signal),
       onState: (state) => {
         broadcast({ type: 'ui:run-state', info: { state, interrupted: false } });
@@ -688,6 +691,10 @@ async function handle(msg: BackgroundRequest): Promise<Result<unknown>> {
       return { ok: true, value: (await getStepDetail(msg.runId, msg.n)) ?? null };
     case 'bg:runs-list':
       return { ok: true, value: await listRuns() };
+    case 'bg:run-usage-export': {
+      const run = await loadRun(msg.runId);
+      return { ok: true, value: run ? exportUsage(run) : null };
+    }
     case 'bg:run-export':
       return { ok: true, value: await exportRun(msg.runId) };
     case 'bg:run-recover':

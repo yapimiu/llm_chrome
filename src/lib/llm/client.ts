@@ -1,3 +1,4 @@
+import { modelIdentity, type HttpAttempt } from './usage';
 import { parseExtraBody, type LlmProfile } from '../settings';
 import { providerInfo } from './providers';
 import { readSse } from './sse';
@@ -40,6 +41,7 @@ export interface ChatOptions {
   /** Сервис перегружен, ждём и повторяем — чтобы показать это в панели. */
   onRetry?: (info: { attempt: number; waitMs: number; error: string }) => void;
   fetchImpl?: FetchFn;
+  onAttempt?: (attempt: HttpAttempt) => void;
 }
 
 export interface ChatResult {
@@ -174,7 +176,7 @@ export function isFormatRejection(err: unknown): boolean {
   return (
     err instanceof HttpError &&
     [400, 422, 500, 501].includes(err.status) &&
-    /response_format|json_schema|schema|grammar|json/i.test(err.body)
+    /response_format|json_schema|json_object|\bschema\b|grammar/i.test(err.body)
   );
 }
 
@@ -233,48 +235,71 @@ async function streamOnce(opts: ChatOptions, format: StructuredFormat, signal: A
   const url = apiUrl(baseUrl, '/chat/completions', providerInfo(profile.provider).apiPrefix);
   const started = performance.now();
 
-  const res = await fetchImpl(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...authHeaders(profile) },
-    body: JSON.stringify(buildRequestBody(profile, opts.messages, format, opts.schema, opts.maxTokens, lean)),
-    signal,
-  });
-  if (!res.ok) {
-    throw new HttpError(res.status, await res.text().catch(() => ''), url, parseRetryAfter(res.headers.get('Retry-After')));
-  }
-  if (!res.body) throw new Error('Пустое тело ответа.');
+  const body = buildRequestBody(profile, opts.messages, format, opts.schema, opts.maxTokens, lean);
+  const encodedBody = JSON.stringify(body);
+  const attempt: HttpAttempt = {
+    provider: providerInfo(profile.provider).id,
+    requestedModel: modelIdentity(body.model),
+    format, lean, outcome: 'network-error', elapsedMs: 0,
+    inputTokens: null, outputTokens: null, cachedInputTokens: null,
+  };
+  const token = (v: unknown): number | null => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+  try {
+    const res = await fetchImpl(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...authHeaders(profile) },
+      body: encodedBody,
+      signal,
+    });
+    attempt.status = res.status;
+    attempt.outcome = res.ok ? 'stream-error' : 'http-error';
+    if (!res.ok) {
+      throw new HttpError(res.status, await res.text().catch(() => ''), url, parseRetryAfter(res.headers.get('Retry-After')));
+    }
+    if (!res.body) throw new Error('Пустое тело ответа.');
 
-  const result: ChatResult = { content: '', reasoning: '', format, totalMs: 0 };
-  for await (const ev of readSse(res.body)) {
-    if (ev.data === '[DONE]') break;
-    let json: unknown;
-    try {
-      json = JSON.parse(ev.data);
-    } catch {
-      continue;
+    const result: ChatResult = { content: '', reasoning: '', format, totalMs: 0 };
+    for await (const ev of readSse(res.body)) {
+      if (ev.data === '[DONE]') break;
+      let json: unknown;
+      try {
+        json = JSON.parse(ev.data);
+      } catch {
+        continue;
+      }
+      if (!isRecord(json)) continue;
+      if (typeof json.model === 'string') attempt.reportedModel = modelIdentity(json.model);
+      if (isRecord(json.error)) {
+        throw new Error(typeof json.error.message === 'string' ? json.error.message : 'Ошибка сервера в потоке.');
+      }
+      if (isRecord(json.usage)) {
+        const u = json.usage;
+        if ('prompt_tokens' in u) attempt.inputTokens = token(u.prompt_tokens);
+        if ('completion_tokens' in u) attempt.outputTokens = token(u.completion_tokens);
+        if (isRecord(u.prompt_tokens_details) && 'cached_tokens' in u.prompt_tokens_details) attempt.cachedInputTokens = token(u.prompt_tokens_details.cached_tokens);
+        result.usage = {
+          promptTokens: typeof u.prompt_tokens === 'number' ? u.prompt_tokens : undefined,
+          completionTokens: typeof u.completion_tokens === 'number' ? u.completion_tokens : undefined,
+        };
+      }
+      const choice: unknown = Array.isArray(json.choices) ? json.choices[0] : undefined;
+      if (isRecord(choice) && typeof choice.finish_reason === 'string') result.finishReason = choice.finish_reason;
+      const delta = parseChunkDelta(json);
+      if (!delta.content && !delta.reasoning) continue;
+      result.ttftMs ??= Math.round(performance.now() - started);
+      result.content += delta.content;
+      result.reasoning += delta.reasoning;
+      opts.onDelta?.(delta);
     }
-    if (!isRecord(json)) continue;
-    if (isRecord(json.error)) {
-      throw new Error(typeof json.error.message === 'string' ? json.error.message : 'Ошибка сервера в потоке.');
-    }
-    if (isRecord(json.usage)) {
-      const u = json.usage;
-      result.usage = {
-        promptTokens: typeof u.prompt_tokens === 'number' ? u.prompt_tokens : undefined,
-        completionTokens: typeof u.completion_tokens === 'number' ? u.completion_tokens : undefined,
-      };
-    }
-    const choice: unknown = Array.isArray(json.choices) ? json.choices[0] : undefined;
-    if (isRecord(choice) && typeof choice.finish_reason === 'string') result.finishReason = choice.finish_reason;
-    const delta = parseChunkDelta(json);
-    if (!delta.content && !delta.reasoning) continue;
-    result.ttftMs ??= Math.round(performance.now() - started);
-    result.content += delta.content;
-    result.reasoning += delta.reasoning;
-    opts.onDelta?.(delta);
+    result.totalMs = Math.round(performance.now() - started);
+    attempt.outcome = 'success';
+    return result;
+  } finally {
+    if (signal.aborted) attempt.outcome = 'aborted';
+    attempt.elapsedMs = Math.round(performance.now() - started);
+    // Observational hooks must never affect request/retry behavior.
+    try { opts.onAttempt?.({ ...attempt }); } catch { /* accounting is best effort */ }
   }
-  result.totalMs = Math.round(performance.now() - started);
-  return result;
 }
 
 /** Сколько раз повторять запрос при перегрузке сервиса и сколько ждать перед повтором. */
@@ -339,6 +364,9 @@ async function streamWithTransientRetry(opts: ChatOptions, format: StructuredFor
  * json_object → без формата, если сервер отвергает response_format, и запоминает рабочий.
  */
 export async function chatStream(opts: ChatOptions): Promise<ChatResult> {
+  const observer = opts.onAttempt;
+  let attemptInChat = 0;
+  opts = { ...opts, onAttempt: (attempt) => observer?.({ ...attempt, attemptInChat: ++attemptInChat }) };
   const { profile } = opts;
   const timeout = AbortSignal.timeout(profile.requestTimeoutSec * 1000);
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;

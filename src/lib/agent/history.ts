@@ -2,84 +2,91 @@ import { formatAction } from './actions';
 import type { ExecutedAction, StepRecord } from './types';
 
 export interface HistoryOptions {
-  /** Сколько последних шагов показывать подробно. */
+  /** Number of recent steps eligible for detailed action targets. */
   detailed: number;
-  /** Жёсткий лимит символов; старые шаги выбрасываются первыми. */
+  /** Soft budget: protected facts and safety directives are never sliced. */
   maxChars: number;
 }
-
 export const DEFAULT_HISTORY: HistoryOptions = { detailed: 3, maxChars: 4000 };
-
-const cut = (s: string, max: number) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
+const cut = (s: string, max: number) => s.length > max ? `${s.slice(0, max - 1)}…` : s;
+const criticalNote = (s: string) => /BLOCKED|POSTPONED|User answered:|user.*(?:reject|refus|denied)|MODEL SWITCH/i.test(s);
+const failedAction = (a: ExecutedAction) => !!a.result && (!a.result.ok || /nothing on the page changed/.test(a.result.message));
+const problem = (s: StepRecord) => !!s.error || s.actions.some((a) => a.skipped || failedAction(a)) || s.warnings.some((w) => w.startsWith('LOOP'));
 
 function actionLine(a: ExecutedAction, withTarget: boolean): string {
-  const target = withTarget && a.target ? ` (${cut(a.target, 60)})` : '';
-  const outcome = a.skipped ? `skipped: ${a.skipped}` : a.result ? (a.result.ok ? a.result.message : `FAILED: ${a.result.message}`) : 'not executed';
+  const protectedAction = a.skipped || failedAction(a);
+  const target = withTarget && a.target ? ` (${protectedAction ? a.target : cut(a.target, 60)})` : '';
+  const outcome = a.skipped ? `skipped: ${a.skipped}` : a.result ? (failedAction(a) ? `FAILED: ${a.result.message}` : cut(a.result.message, 80)) : 'not executed';
   return `${formatAction(a.action)}${target} → ${outcome}`;
 }
 
-function detailedStep(s: StepRecord): string {
+/** Exact duplicates retain their first source. Recent distinct failures remain complete. */
+function protectedContext(steps: readonly StepRecord[], extracted: readonly string[]): string[] {
+  const parts: string[] = [];
+  const facts = [...new Set(extracted)];
+  if (facts.length) parts.push(`Saved notes (from extract):\n${facts.map((e, i) => `${i + 1}. ${e}`).join('\n')}`);
+  const safety = new Map<string, string>();
+  const failures = new Map<string, string>();
+  const notes = new Map<string, string>();
+  const add = (map: Map<string, string>, key: string, n: number, text: string) => { if (!map.has(key)) map.set(key, `Step ${n}: ${text}`); };
+  for (const s of steps) {
+    if (s.error) add(failures, `error:${s.error}`, s.n, `error: ${s.error}`);
+    for (const a of s.actions) {
+      if (a.skipped) add(safety, `skip:${actionLine(a, true)}`, s.n, actionLine(a, true));
+      else if (failedAction(a)) add(failures, `action:${actionLine(a, true)}`, s.n, actionLine(a, true));
+    }
+    for (const note of s.notes) {
+      if (criticalNote(note)) add(safety, `note:${note}`, s.n, `note: ${note}`);
+      else add(notes, note, s.n, `note: ${cut(note, 180)}`);
+    }
+    for (const warning of s.warnings.filter((w) => w.startsWith('LOOP'))) add(failures, `warning:${warning}`, s.n, `warning: ${warning}`);
+  }
+  const lines = [...safety.values(), ...[...failures.values()].slice(-6), ...[...notes.values()].slice(-6)];
+  if (lines.length) parts.push(`Important context (historical actions; use current observation indices):\n${lines.join('\n')}`);
+  return parts;
+}
+
+function stepText(s: StepRecord, detailed: boolean): string {
+  // Failure and note records already occur in the protected block.
+  const actions = s.actions.filter((a) => !a.skipped && !failedAction(a));
+  if (!detailed) return `Step ${s.n}: ${actions.map((a) => actionLine(a, false)).join('; ') || 'see important context'}`;
   const lines = [`Step ${s.n} (${cut(s.url, 100)}):`];
-  if (s.reasoning) lines.push(`  reasoning: ${cut(s.reasoning, 300)}`);
-  if (s.expectedOutcome) lines.push(`  expected: ${cut(s.expectedOutcome, 200)}`);
-  for (const a of s.actions) lines.push(`  - ${actionLine(a, true)}`);
-  if (s.error) lines.push(`  error: ${cut(s.error, 200)}`);
-  for (const n of s.notes) lines.push(`  note: ${cut(n, 500)}`);
-  for (const w of s.warnings.filter((w) => w.startsWith('LOOP'))) lines.push(`  warning: ${w}`);
+  if (problem(s)) {
+    if (s.reasoning) lines.push(`  reasoning: ${cut(s.reasoning, 300)}`);
+    if (s.expectedOutcome) lines.push(`  expected: ${cut(s.expectedOutcome, 200)}`);
+  }
+  for (const a of actions) lines.push(`  - ${actionLine(a, true)}`);
   return lines.join('\n');
 }
 
-/** Старый шаг в одну строку: что делали и чем кончилось. */
-function compactStep(s: StepRecord): string {
-  const acts = s.actions.map((a) => actionLine(a, false)).join('; ');
-  const notes = s.notes.length ? ` | ${s.notes.map((n) => cut(n, 150)).join(' | ')}` : '';
-  return `Step ${s.n}: ${acts || s.error || 'no actions'}${notes}`;
-}
-
-/**
- * История для промпта: последние шаги подробно, более старые — одной строкой,
- * а при нехватке места самые старые выбрасываются. Сохранённые заметки (extract) идут всегда.
- */
-export function buildHistory(steps: readonly StepRecord[], extracted: readonly string[], opts: HistoryOptions = DEFAULT_HISTORY): string {
-  const parts: string[] = [];
-  if (extracted.length) parts.push(`Saved notes (from extract):\n${extracted.map((e, i) => `${i + 1}. ${e}`).join('\n')}`);
-  if (steps.length === 0) return parts.join('\n\n');
-
-  const split = Math.max(0, steps.length - opts.detailed);
-  const recent = steps.slice(split).map(detailedStep);
-  const older = steps.slice(0, split).map(compactStep);
-
-  const fixed = [...parts, recent.join('\n')].join('\n\n');
-  let budget = opts.maxChars - fixed.length - 60;
-  const keptOlder: string[] = [];
-  for (let i = older.length - 1; i >= 0 && budget > 0; i--) {
-    const line = older[i]!;
-    if (line.length + 1 > budget) break;
-    keptOlder.unshift(line);
-    budget -= line.length + 1;
+function budgeted(parts: string[], candidates: string[], maxChars: number, omittedLabel: string): string {
+  const floor = parts.join('\n\n');
+  if (floor.length > maxChars) return `${floor}\n\n[History soft budget exceeded: protected context retained in full.]`;
+  if (floor.length + omittedLabel.length + 2 > maxChars) return floor;
+  const kept: string[] = [];
+  // Reserve omission metadata before packing complete records. Never slice an action.
+  let room = maxChars - floor.length - omittedLabel.length - 4;
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const candidate = candidates[i]!;
+    if (candidate.length + 2 > room) continue;
+    kept.unshift(candidate);
+    room -= candidate.length + 2;
   }
-  const dropped = older.length - keptOlder.length;
-  const olderBlock = [dropped > 0 ? `(${dropped} earlier steps omitted)` : '', ...keptOlder].filter(Boolean).join('\n');
-
-  const out = [...parts, olderBlock, recent.join('\n')].filter(Boolean).join('\n\n');
-  return out.length > opts.maxChars ? `…${out.slice(out.length - opts.maxChars + 1)}` : out;
+  return [...parts, kept.length < candidates.length ? omittedLabel.replace(/\d+ earlier steps/, `${candidates.length - kept.length} earlier steps`) : '', ...kept].filter(Boolean).join('\n\n');
 }
 
-/**
- * Короткая сводка вместо истории — «сброс контекста»: заметки из extract целиком, пройденные страницы
- * и два последних шага. Строится без обращения к модели, поэтому токенов не тратит.
- */
+export function buildHistory(steps: readonly StepRecord[], extracted: readonly string[], opts: HistoryOptions = DEFAULT_HISTORY): string {
+  const parts = protectedContext(steps, extracted);
+  if (!steps.length) return budgeted(parts, [], opts.maxChars, '');
+  const split = Math.max(0, steps.length - opts.detailed);
+  return budgeted(parts, steps.map((s, i) => stepText(s, i >= split)), opts.maxChars, `(${steps.length} earlier steps omitted)`);
+}
+
 export function buildDigest(steps: readonly StepRecord[], extracted: readonly string[], keep = 2, maxChars = DEFAULT_HISTORY.maxChars): string {
-  const parts: string[] = [];
-  if (extracted.length) parts.push(`Saved notes (from extract):\n${extracted.map((e, i) => `${i + 1}. ${e}`).join('\n')}`);
-  if (steps.length === 0) return parts.join('\n\n');
+  const parts = protectedContext(steps, extracted);
+  if (!steps.length) return budgeted(parts, [], maxChars, '');
   const pages = [...new Set(steps.map((s) => cut(s.url, 80)).filter(Boolean))].slice(-6);
-  const failed = steps.filter((s) => s.error || s.actions.some((a) => a.result && !a.result.ok)).length;
-  parts.push(
-    `Earlier context was reset to save space. So far: ${steps.length} steps (${failed} with problems).${pages.length ? ` Pages visited, oldest first: ${pages.join(' → ')}.` : ''}`,
-  );
-  parts.push(steps.slice(-keep).map(compactStep).join('\n'));
-  const out = parts.filter(Boolean).join('\n\n');
-  // Как и история, не длиннее лимита: иначе «сброс» с длинными заметками extract раздул бы промпт.
-  return out.length > maxChars ? `…${out.slice(out.length - maxChars + 1)}` : out;
+  const failed = steps.filter(problem).length;
+  const summary = `Earlier context was reset to save space. So far: ${steps.length} steps (${failed} with problems).${pages.length ? ` Pages visited, oldest first: ${pages.join(' → ')}.` : ''}`;
+  return budgeted(parts, [summary, ...(keep > 0 ? steps.slice(-keep) : []).map((s) => stepText(s, false))], maxChars, '(earlier context omitted)');
 }

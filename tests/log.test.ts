@@ -1,3 +1,4 @@
+import { exportUsage } from '@/lib/llm/usage';
 import 'fake-indexeddb/auto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { addDeferred, exportRun, getDeferred, getStepDetail, listDeferred, listRuns, loadRun, pruneDeferred, pruneRuns, resetLogDb, saveRun, saveStep, setDeferredStatus } from '@/lib/log/db';
@@ -137,4 +138,27 @@ describe('этап 6: загрузка запуска и очередь', () => 
     expect(await pruneDeferred(10 + 14 * 24 * 3600 * 1000)).toBe(1);
     expect((await listDeferred()).map((i) => i.id)).toEqual(['p1', 'r1', 'p2']);
   });
+});
+
+describe('additive usage persistence', () => {
+  it('roundtrips usage alongside legacy records without schema migration', async () => {
+    await saveRun(run('usage', 1));
+    const measured = { ...step(2), usage: { parseRetries: 1, attempts: [{ provider: 'local', requestedModel: 'model', format: 'none' as const, lean: false, outcome: 'success' as const, elapsedMs: 2, inputTokens: 0, outputTokens: null, cachedInputTokens: null }] } };
+    await saveStep('usage', step(1));
+    await saveStep('usage', measured);
+    expect((await loadRun('usage'))?.steps[0]?.usage).toBeUndefined();
+    expect((await loadRun('usage'))?.steps[1]?.usage).toEqual(measured.usage);
+    expect((await exportRun('usage'))?.steps[1]?.usage).toEqual(measured.usage);
+  });
+});
+
+
+it('exports light loaded accounting without loading heavy step details', async () => {
+  await saveRun(run('usage-only', 1, { status: 'failed', task: 'PRIVATE_TASK' }));
+  await saveStep('usage-only', { ...step(1), usage: { attempts: [], parseRetries: 2, parseErrors: 3, chatCalls: 3, unmeasuredChatCalls: 3 } }, { runId: 'usage-only', n: 1, observation: 'PRIVATE_PAGE', history: 'PRIVATE_HISTORY', responses: [{ content: 'PRIVATE_RESPONSE', reasoning: '' }] });
+  const loaded = await loadRun('usage-only');
+  expect(loaded).not.toBeNull();
+  const safe = exportUsage(loaded!);
+  expect(safe.summary).toMatchObject({ status: 'failed', parseErrors: { reported: 3, unknownSteps: 0 }, parseRetries: 2, chatCalls: 3 });
+  expect(JSON.stringify(safe)).not.toContain('PRIVATE');
 });

@@ -32,6 +32,13 @@ export function RunLog() {
     download(`agent-run-${stamp}.json`, res.value);
   };
 
+  const exportTokens = async (run: RunSummary) => {
+    const res = await sendToBackground({ type: 'bg:run-usage-export', runId: run.id });
+    if (!res.ok) return setError(res.error);
+    const stamp = new Date(run.startedAt).toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    download(`agent-usage-${stamp}.json`, res.value);
+  };
+
   return (
     <details class="card runlog" onToggle={(e) => void load(e.currentTarget.open)}>
       <summary>Журнал запусков</summary>
@@ -47,6 +54,7 @@ export function RunLog() {
                 <button class="link" onClick={() => void exportRun(r)}>
                   JSON
                 </button>
+                <button class="link" onClick={() => void exportTokens(r)}>Токены</button>
               </div>
             </li>
           ))}

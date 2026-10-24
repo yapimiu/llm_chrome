@@ -697,3 +697,88 @@ describe('AgentRunner', () => {
   });
 });
 
+
+describe('transport accounting integration', () => {
+  it('marks mock/legacy chat implementations without callbacks as unmeasured', async () => {
+    const h = harness([reply([{ action: 'done', result: 'ok' }])]);
+    const state = await new AgentRunner(cfg, h.deps).run();
+    expect(state.steps[0]?.usage).toMatchObject({ chatCalls: 1, unmeasuredChatCalls: 1, attempts: [] });
+  });
+
+  const transport = { provider: 'local', requestedModel: 'qwen3', format: 'none' as const, lean: false, outcome: 'success' as const, elapsedMs: 1, inputTokens: 10, outputTokens: 2, cachedInputTokens: null };
+  it('retains all parse retries and model identity in step accounting', async () => {
+    const h = harness([]);
+    let calls = 0;
+    h.deps.chat = async (_m, _s, _d, _r, _signal, _id, onAttempt) => {
+      onAttempt?.({ ...transport });
+      calls++;
+      return calls < 3 ? { ...reply([]), content: 'invalid' } : reply([{ action: 'done', result: 'ok' }]);
+    };
+    const state = await new AgentRunner(cfg, h.deps).run();
+    expect(state.steps[0]?.usage).toMatchObject({ parseRetries: 2, chatCalls: 3, unmeasuredChatCalls: 0, attempts: [transport, transport, transport] });
+  });
+  it('persists failure accounting before ending the step', async () => {
+    const h = harness([]);
+    h.deps.chat = async (_m, _s, _d, _r, _signal, _id, onAttempt) => {
+      onAttempt?.({ ...transport, outcome: 'http-error', status: 401, inputTokens: null, outputTokens: null });
+      throw new HttpError(401, 'PRIVATE_BODY', 'PRIVATE_URL');
+    };
+    const state = await new AgentRunner(cfg, h.deps).run();
+    expect(state.steps[0]?.usage?.attempts[0]).toMatchObject({ status: 401, inputTokens: null });
+    expect(h.deps.persistStep).toHaveBeenCalled();
+  });
+  it('persists an in-flight attempt on stop', async () => {
+    const h = harness([]);
+    const runner = new AgentRunner(cfg, h.deps);
+    h.deps.chat = async (_m, _s, _d, _r, signal, _id, onAttempt) => {
+      runner.stop();
+      onAttempt?.({ ...transport, outcome: 'aborted' });
+      signal.throwIfAborted();
+      return reply([]);
+    };
+    const state = await runner.run();
+    expect(state.status).toBe('stopped');
+    expect(state.steps[0]?.usage?.attempts[0]?.outcome).toBe('aborted');
+    expect(h.deps.persistStep).toHaveBeenCalled();
+  });
+});
+
+describe('adaptive observations always bind fresh handles', () => {
+  it.each(['incomplete', 'navigation'])('reobserves Standard before LLM when Minimal has %s', async (reason) => {
+    const h = harness([reply([{ action: 'click', index: 1 }]), reply([{ action: 'click', index: 1 }]), reply([{ action: 'done', result: 'ok' }])]);
+    const original = h.deps.observe;
+    let count = 0;
+    const options: { maxChars?: number; maxTextPerElement?: number }[] = [];
+    h.deps.observe = async (opts) => {
+      count++;
+      options.push(opts ?? {});
+      const obs = await original(opts);
+      return { ...obs, complete: count === 2 ? reason !== 'incomplete' : true, url: count === 2 && reason === 'navigation' ? 'https://new.example/' : obs.url, handle: { ...obs.handle, frames: [{ frameId: 0, snapshotId: count }] } };
+    };
+    const handles: number[] = [];
+    h.deps.execute = async (_a, handle) => { handles.push(handle.frames[0]!.snapshotId); return { ok: true, message: 'ok' }; };
+    await new AgentRunner({ ...cfg, observationMode: 'adaptive', maxObservationChars: 12000 }, h.deps).run();
+    expect(options.slice(0, 3).map((o) => o.maxChars)).toEqual([12000, 4000, 12000]);
+    expect(handles.slice(0, 2)).toEqual([1, 3]);
+    expect(h.chats).toBe(3);
+  });
+});
+
+
+it('preserves the current dependency cap for restored configs without an observation cap', async () => {
+  const h = harness([reply([{ action: 'done', result: 'ok' }])]);
+  const original = h.deps.observe;
+  h.deps.observe = async (opts) => ({ ...await original(opts), observation: 'x'.repeat(Math.min(25000, opts?.maxChars ?? Infinity)) });
+  await new AgentRunner({ ...cfg, contextTokens: 64000 }, h.deps).run();
+  const sent = vi.mocked(h.deps.chat).mock.calls[0]![0];
+  expect(JSON.stringify(sent)).toContain('x'.repeat(25000));
+});
+
+
+it('counts the final exhausted invalid reply as a parse error without an extra retry', async () => {
+  const invalid = { ...reply([]), content: 'invalid' };
+  const h = harness([invalid, invalid, invalid, reply([{ action: 'done', result: 'ok' }])]);
+  const state = await new AgentRunner(cfg, h.deps).run();
+  expect(state.steps[0]?.usage).toMatchObject({ parseErrors: 3, parseRetries: 2, chatCalls: 3 });
+  expect(state.steps[1]?.usage).toMatchObject({ parseErrors: 0, parseRetries: 0, chatCalls: 1 });
+});
